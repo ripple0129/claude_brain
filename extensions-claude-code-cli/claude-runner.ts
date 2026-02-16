@@ -180,6 +180,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunClaudeResult
     let fullText = "";
     let stderr = "";
     let lineBuf = "";
+    let resultError = ""; // Error from result event (in stdout, not stderr)
     // Track which tool_use blocks we've already emitted notifications for
     const emittedToolBlocks = new Set<string>();
 
@@ -253,6 +254,11 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunClaudeResult
           if (typeof event.session_id === "string") {
             sessionId = event.session_id as string;
           }
+          // Capture error details from result event (shown in stdout, not stderr)
+          if (event.is_error || event.subtype === "error_during_execution") {
+            const errors = event.errors as string[] | undefined;
+            resultError = errors?.join("; ") ?? String(event.result ?? "unknown error");
+          }
           // Don't overwrite fullText with result — we've been accumulating
           // text + tool content which is richer than result.result
           return;
@@ -310,9 +316,10 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunClaudeResult
       }
 
       if (code !== 0) {
+        const detail = resultError || stderr.trim() || "(no details)";
         reject(
           new ClaudeExitError(
-            `Claude CLI exited with code ${code}: ${stderr.trim() || "(no stderr)"}`,
+            `Claude CLI exited with code ${code}: ${detail}`,
             code ?? 1,
             stderr,
           ),
