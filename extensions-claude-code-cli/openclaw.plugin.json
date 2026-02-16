@@ -1,0 +1,28 @@
+{
+  "id": "claude-code-cli",
+  "name": "Claude Code CLI",
+  "description": "Bridge provider that routes OpenAI-compatible requests to the Claude Code CLI.",
+  "providers": ["claude-code-cli"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "port": {
+        "type": "number",
+        "description": "HTTP bridge port"
+      },
+      "claudePath": {
+        "type": "string",
+        "description": "Path to the claude CLI binary"
+      },
+      "timeoutMs": {
+        "type": "number",
+        "description": "CLI timeout in milliseconds"
+      },
+      "mcpConfigPath": {
+        "type": "string",
+        "description": "Path to MCP servers JSON config file (passed to claude --mcp-config)"
+      }
+    }
+  }
+}
