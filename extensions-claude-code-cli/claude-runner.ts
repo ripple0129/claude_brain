@@ -62,6 +62,32 @@ function formatAskUserQuestion(input: Record<string, unknown>): string {
 }
 
 /**
+ * Extract a short summary of the tool input for inline display.
+ * e.g. Bash {command:"ls -la"} → "ls -la"
+ */
+function summarizeToolInput(name: string, input: Record<string, unknown>): string {
+  // Pick the most representative field for each known tool
+  const key =
+    name === "Bash" ? "command"
+    : name === "Read" ? "file_path"
+    : name === "Write" ? "file_path"
+    : name === "Edit" ? "file_path"
+    : name === "Grep" ? "pattern"
+    : name === "Glob" ? "pattern"
+    : name === "WebFetch" ? "url"
+    : name === "WebSearch" ? "query"
+    : name === "Task" ? "description"
+    : null;
+
+  if (key && typeof input[key] === "string") {
+    const val = input[key] as string;
+    // Truncate long values
+    return val.length > 120 ? val.slice(0, 117) + "..." : val;
+  }
+  return "";
+}
+
+/**
  * Format tool_use content blocks from assistant message into readable text
  */
 function formatToolContent(content: unknown[]): string {
@@ -76,9 +102,42 @@ function formatToolContent(content: unknown[]): string {
     if (name === "AskUserQuestion") {
       parts.push(formatAskUserQuestion(input));
     } else if (!INTERACTIVE_TOOLS.has(name)) {
-      // Non-interactive tool: emit brief notification
-      parts.push(`\n[${name}]\n`);
+      const summary = summarizeToolInput(name, input);
+      parts.push(summary ? `\n[${name}] ${summary}\n` : `\n[${name}]\n`);
     }
+  }
+  return parts.join("");
+}
+
+/**
+ * Format tool_result content into readable text.
+ * Truncates long results to keep the stream readable.
+ */
+function formatToolResult(content: unknown[]): string {
+  const parts: string[] = [];
+  for (const block of content) {
+    const b = block as Record<string, unknown>;
+    if (b.type !== "tool_result") continue;
+
+    let text = "";
+    if (typeof b.content === "string") {
+      text = b.content;
+    } else if (Array.isArray(b.content)) {
+      text = (b.content as Record<string, unknown>[])
+        .filter((c) => c.type === "text" && typeof c.text === "string")
+        .map((c) => c.text as string)
+        .join("\n");
+    }
+
+    if (!text.trim()) continue;
+
+    // Truncate very long results (e.g. file contents, command output)
+    const maxLen = 800;
+    const truncated = text.length > maxLen
+      ? text.slice(0, maxLen) + `\n... (${text.length - maxLen} chars truncated)`
+      : text;
+
+    parts.push(`\n📎 結果：\n${truncated}\n`);
   }
   return parts.join("");
 }
@@ -170,6 +229,20 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunClaudeResult
                   opts.onText?.(formatted);
                 }
               }
+            }
+          }
+          return;
+        }
+
+        // Tool result from executed tool (type: "user" with tool_result content)
+        if (event.type === "user") {
+          const msg = event.message as Record<string, unknown> | undefined;
+          const content = msg?.content as unknown[] | undefined;
+          if (Array.isArray(content)) {
+            const formatted = formatToolResult(content);
+            if (formatted) {
+              fullText += formatted;
+              opts.onText?.(formatted);
             }
           }
           return;
