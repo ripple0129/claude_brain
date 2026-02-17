@@ -200,13 +200,24 @@ export function createBridgeServer(opts: BridgeOptions) {
       return;
     }
 
-    const fingerprint = computeFingerprint(systemPrompt, firstUserMsg);
+    // Use a fixed session key — single active session per bridge.
+    // The fingerprint-per-conversation approach fails because the system prompt
+    // contains dynamic content (runtime info, etc.) that changes every request.
+    const sessionKey = "active";
+
+    // Debug: log fingerprint components to diagnose session issues
+    const debugFp = computeFingerprint(systemPrompt, firstUserMsg);
+    logger.info(
+      `claude-code-cli: request — msgs=${messages.length} sysprompt=${systemPrompt.length}c ` +
+      `firstUser="${firstUserMsg.slice(0, 60)}${firstUserMsg.length > 60 ? "..." : ""}" ` +
+      `fp=${debugFp} key=${sessionKey}`,
+    );
 
     // Handle /new command — clear session and confirm
     const trimmed = latestUserMsg.trim().toLowerCase();
     if (trimmed === "/new" || trimmed === "/reset") {
-      await deleteSession(stateDir, fingerprint);
-      logger.info(`claude-code-cli: session cleared for fingerprint ${fingerprint}`);
+      await deleteSession(stateDir, sessionKey);
+      logger.info(`claude-code-cli: session cleared`);
       const reply = "Session cleared. Next message will start a new conversation.";
       if (isStreaming) {
         sseFullMessage(res, reply, model);
@@ -225,7 +236,10 @@ export function createBridgeServer(opts: BridgeOptions) {
 
     try {
       const result = await mutex.run(async () => {
-        const existing = await getSession(stateDir, fingerprint);
+        const existing = await getSession(stateDir, sessionKey);
+        logger.info(
+          `claude-code-cli: session lookup — ${existing ? `found sid=${existing.sessionId.slice(0, 12)}` : "no existing session"}`,
+        );
 
         const sseId = `chatcmpl-${Date.now()}`;
         const sseCreated = Math.floor(Date.now() / 1000);
@@ -253,28 +267,32 @@ export function createBridgeServer(opts: BridgeOptions) {
 
         if (existing) {
           try {
+            logger.info(`claude-code-cli: resuming session ${existing.sessionId.slice(0, 12)}...`);
             out = await runClaude({
               message: latestUserMsg,
               sessionId: existing.sessionId,
               ...runOpts,
             });
-            await putSession(stateDir, fingerprint, out.sessionId);
+            await putSession(stateDir, sessionKey, out.sessionId);
+            logger.info(`claude-code-cli: resume succeeded`);
           } catch (err) {
             logger.warn(
               `claude-code-cli: resume failed for session ${existing.sessionId}, retrying as new: ${err instanceof Error ? err.message : err}`,
             );
-            await deleteSession(stateDir, fingerprint);
+            await deleteSession(stateDir, sessionKey);
             out = undefined;
           }
         }
 
         if (!out) {
+          logger.info(`claude-code-cli: creating new session...`);
           out = await runClaude({
             message: latestUserMsg,
             systemPrompt: systemPrompt || undefined,
             ...runOpts,
           });
-          await putSession(stateDir, fingerprint, out.sessionId);
+          await putSession(stateDir, sessionKey, out.sessionId);
+          logger.info(`claude-code-cli: new session created sid=${out.sessionId.slice(0, 12)}`);
         }
 
         if (keepAliveTimer) clearInterval(keepAliveTimer);
