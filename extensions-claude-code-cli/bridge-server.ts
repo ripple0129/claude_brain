@@ -12,6 +12,7 @@ import {
   putSession,
   deleteSession,
 } from "./session-store.js";
+import { findAndUploadImages, replaceImagePaths } from "./image-replacer.js";
 
 type BridgeOptions = {
   port: number;
@@ -278,6 +279,20 @@ export function createBridgeServer(opts: BridgeOptions) {
 
         if (keepAliveTimer) clearInterval(keepAliveTimer);
 
+        // Upload any local image files and append URLs before finishing
+        if (isStreaming && out) {
+          const workDir = process.env.OPENCLAW_WORKSPACE
+            ?? `${process.env.HOME}/.openclaw/workspace`;
+          try {
+            const urls = await findAndUploadImages(out.text, workDir, logger);
+            for (const url of urls) {
+              sseDelta(res, sseId, sseCreated, model, `\n\n![image](${url})`);
+            }
+          } catch (err) {
+            logger.warn(`claude-code-cli: image upload failed: ${err}`);
+          }
+        }
+
         // Finish SSE stream
         if (isStreaming) {
           sseFinish(res, sseId, sseCreated, model);
@@ -288,12 +303,18 @@ export function createBridgeServer(opts: BridgeOptions) {
 
       // Non-streaming response
       if (!isStreaming) {
+        const workDir = process.env.OPENCLAW_WORKSPACE
+          ?? `${process.env.HOME}/.openclaw/workspace`;
+        let content = result.result.text;
+        try {
+          content = await replaceImagePaths(content, workDir, logger);
+        } catch { /* ignore */ }
         jsonResponse(res, 200, {
           id: `chatcmpl-${Date.now()}`,
           object: "chat.completion",
           created: Math.floor(Date.now() / 1000),
           model,
-          choices: [{ index: 0, message: { role: "assistant", content: result.result.text }, finish_reason: "stop" }],
+          choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
           usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
         });
       }
