@@ -284,7 +284,7 @@ export function createBridgeServer(opts: BridgeOptions) {
           const workDir = process.env.OPENCLAW_WORKSPACE
             ?? `${process.env.HOME}/.openclaw/workspace`;
           try {
-            const urls = await findAndUploadImages(out.text, workDir, logger);
+            const urls = await findAndUploadImages(out.fullText, workDir, logger);
             for (const url of urls) {
               sseDelta(res, sseId, sseCreated, model, `\n\n![image](${url})`);
             }

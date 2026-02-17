@@ -11,7 +11,10 @@ export type RunClaudeOptions = {
 };
 
 export type RunClaudeResult = {
+  /** Prose-only text (no tool calls/results) — used for final message */
   text: string;
+  /** Full text including tool calls and results — used for image path scanning */
+  fullText: string;
   sessionId: string;
 };
 
@@ -177,7 +180,8 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunClaudeResult
     });
 
     let sessionId = "";
-    let fullText = "";
+    let fullText = "";   // Everything: prose + tool calls + tool results
+    let proseText = "";  // Only text_delta from Claude (no tool noise)
     let stderr = "";
     let lineBuf = "";
     let resultError = ""; // Error from result event (in stdout, not stderr)
@@ -197,7 +201,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunClaudeResult
           return;
         }
 
-        // Streaming text delta
+        // Streaming text delta — this is Claude's prose (no tool noise)
         if (event.type === "stream_event") {
           const inner = event.event as Record<string, unknown> | undefined;
           if (inner?.type === "content_block_delta") {
@@ -205,6 +209,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunClaudeResult
             if (delta?.type === "text_delta" && typeof delta.text === "string") {
               const text = delta.text as string;
               fullText += text;
+              proseText += text;
               opts.onText?.(text);
             }
           }
@@ -212,7 +217,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunClaudeResult
         }
 
         // Accumulated assistant message — extract tool_use content
-        // This fires for each tool_use with the complete input
+        // Tool calls only go to fullText (for image path scanning), NOT to SSE stream
         if (event.type === "assistant") {
           const msg = event.message as Record<string, unknown> | undefined;
           const content = msg?.content as unknown[] | undefined;
@@ -220,14 +225,12 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunClaudeResult
             for (const block of content) {
               const b = block as Record<string, unknown>;
               if (b.type === "tool_use" && typeof b.id === "string") {
-                // Only emit once per tool_use block
                 if (emittedToolBlocks.has(b.id as string)) continue;
                 emittedToolBlocks.add(b.id as string);
 
                 const formatted = formatToolContent([block]);
                 if (formatted) {
                   fullText += formatted;
-                  opts.onText?.(formatted);
                 }
               }
             }
@@ -236,6 +239,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunClaudeResult
         }
 
         // Tool result from executed tool (type: "user" with tool_result content)
+        // Tool results only go to fullText (for image path scanning), NOT to SSE stream
         if (event.type === "user") {
           const msg = event.message as Record<string, unknown> | undefined;
           const content = msg?.content as unknown[] | undefined;
@@ -243,7 +247,6 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunClaudeResult
             const formatted = formatToolResult(content);
             if (formatted) {
               fullText += formatted;
-              opts.onText?.(formatted);
             }
           }
           return;
@@ -332,7 +335,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunClaudeResult
         return;
       }
 
-      resolve({ text: fullText, sessionId });
+      resolve({ text: proseText, fullText, sessionId });
     });
   });
 }
