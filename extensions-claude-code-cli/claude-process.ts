@@ -25,6 +25,7 @@ export type SendMessageResult = {
 const INTERACTIVE_TOOLS = new Set(["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"]);
 
 const DEFAULT_CLAUDE_PATH = "claude";
+const TURN_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes — safety net for stuck turns
 
 /**
  * Format AskUserQuestion tool input into readable text
@@ -95,6 +96,7 @@ export class ClaudeProcess {
   private turnFullText = "";
   private turnOnText: ((text: string) => void) | null = null;
   private emittedToolBlocks = new Set<string>();
+  private turnTimeout: ReturnType<typeof setTimeout> | null = null;
 
   constructor(opts: ClaudeProcessOptions) {
     this.opts = opts;
@@ -158,6 +160,7 @@ export class ClaudeProcess {
       log.error(`claude-process: spawn error: ${err.message}`);
       this.alive = false;
       this.child = null;
+      this.clearTurnTimeout();
       if (this.turnReject) {
         this.turnReject(new Error(`Claude process error: ${err.message}`));
         this.turnResolve = null;
@@ -169,6 +172,7 @@ export class ClaudeProcess {
       log.warn(`claude-process: process exited code=${code}`);
       this.alive = false;
       this.child = null;
+      this.clearTurnTimeout();
       if (this.turnReject) {
         this.turnReject(new Error(`Claude process exited unexpectedly (code ${code})`));
         this.turnResolve = null;
@@ -202,6 +206,15 @@ export class ClaudeProcess {
       this.turnResolve = resolve;
       this.turnReject = reject;
 
+      // Safety timeout — if result never arrives, resolve with what we have
+      this.turnTimeout = setTimeout(() => {
+        log.error(
+          `claude-process: turn timeout after ${TURN_TIMEOUT_MS / 1000}s ` +
+          `proseLen=${this.turnProseText.length} fullLen=${this.turnFullText.length}`,
+        );
+        this.completeTurn();
+      }, TURN_TIMEOUT_MS);
+
       const msg = JSON.stringify({
         type: "user",
         message: { role: "user", content: text },
@@ -212,6 +225,7 @@ export class ClaudeProcess {
       this.child!.stdin!.write(msg + "\n", (err) => {
         if (err) {
           log.error(`claude-process: stdin write error: ${err.message}`);
+          this.clearTurnTimeout();
           this.turnResolve = null;
           this.turnReject = null;
           reject(new Error(`Failed to write to Claude stdin: ${err.message}`));
@@ -220,131 +234,168 @@ export class ClaudeProcess {
     });
   }
 
+  /** Clear the per-turn timeout. */
+  private clearTurnTimeout(): void {
+    if (this.turnTimeout) {
+      clearTimeout(this.turnTimeout);
+      this.turnTimeout = null;
+    }
+  }
+
+  /** Resolve the current turn with accumulated text. */
+  private completeTurn(): void {
+    this.clearTurnTimeout();
+    if (this.turnResolve) {
+      const resolve = this.turnResolve;
+      this.turnResolve = null;
+      this.turnReject = null;
+      this.turnOnText = null;
+      resolve({
+        text: this.turnProseText,
+        fullText: this.turnFullText,
+        sessionId: this.sessionId,
+      });
+    }
+  }
+
   /** Process a single line of stdout JSON. */
   private processLine(line: string): void {
     if (!line.trim()) return;
 
+    const log = this.opts.logger;
+    let event: Record<string, unknown>;
     try {
-      const event = JSON.parse(line) as Record<string, unknown>;
-
-      // Session init
-      if (event.type === "system" && event.subtype === "init") {
-        if (typeof event.session_id === "string") {
-          this.sessionId = event.session_id as string;
-          this.opts.logger.info(
-            `claude-process: session init sid=${this.sessionId.slice(0, 12)}`,
-          );
-        }
-        return;
-      }
-
-      // Streaming text delta — Claude's prose
-      if (event.type === "stream_event") {
-        const inner = event.event as Record<string, unknown> | undefined;
-        if (inner?.type === "content_block_delta") {
-          const delta = inner.delta as Record<string, unknown> | undefined;
-          if (delta?.type === "text_delta" && typeof delta.text === "string") {
-            const text = delta.text as string;
-            this.turnFullText += text;
-            this.turnProseText += text;
-            this.turnOnText?.(text);
-          }
-        }
-        return;
-      }
-
-      // Accumulated assistant message — extract tool_use content
-      if (event.type === "assistant") {
-        const msg = event.message as Record<string, unknown> | undefined;
-        const content = msg?.content as unknown[] | undefined;
-        if (Array.isArray(content)) {
-          for (const block of content) {
-            const b = block as Record<string, unknown>;
-            if (b.type === "tool_use" && typeof b.id === "string") {
-              if (this.emittedToolBlocks.has(b.id as string)) continue;
-              this.emittedToolBlocks.add(b.id as string);
-
-              const name = b.name as string;
-              const input = (b.input ?? {}) as Record<string, unknown>;
-
-              if (name === "AskUserQuestion") {
-                const formatted = formatAskUserQuestion(input);
-                if (formatted) this.turnFullText += formatted;
-              } else if (!INTERACTIVE_TOOLS.has(name)) {
-                const summary = summarizeToolInput(name, input);
-                const formatted = summary ? `\n[${name}] ${summary}\n` : `\n[${name}]\n`;
-                this.turnFullText += formatted;
-              }
-            }
-          }
-        }
-        return;
-      }
-
-      // Tool result
-      if (event.type === "user") {
-        const msg = event.message as Record<string, unknown> | undefined;
-        const content = msg?.content as unknown[] | undefined;
-        if (Array.isArray(content)) {
-          for (const block of content) {
-            const b = block as Record<string, unknown>;
-            if (b.type !== "tool_result") continue;
-
-            let resultText = "";
-            if (typeof b.content === "string") {
-              resultText = b.content;
-            } else if (Array.isArray(b.content)) {
-              resultText = (b.content as Record<string, unknown>[])
-                .filter((c) => c.type === "text" && typeof c.text === "string")
-                .map((c) => c.text as string)
-                .join("\n");
-            }
-
-            if (resultText.trim()) {
-              const maxLen = 800;
-              const truncated = resultText.length > maxLen
-                ? resultText.slice(0, maxLen) + `\n... (${resultText.length - maxLen} chars truncated)`
-                : resultText;
-              this.turnFullText += `\n📎 結果：\n${truncated}\n`;
-            }
-          }
-        }
-        return;
-      }
-
-      // Result event — turn is complete
-      if (event.type === "result") {
-        if (typeof event.session_id === "string") {
-          this.sessionId = event.session_id as string;
-        }
-
-        if (event.is_error || event.subtype === "error_during_execution") {
-          const errors = event.errors as string[] | undefined;
-          const errorMsg = errors?.join("; ") ?? String(event.result ?? "unknown error");
-          this.opts.logger.error(`claude-process: turn error: ${errorMsg}`);
-        }
-
-        this.opts.logger.info(
-          `claude-process: turn complete sid=${this.sessionId.slice(0, 12)} ` +
-          `proseLen=${this.turnProseText.length} fullLen=${this.turnFullText.length}`,
-        );
-
-        if (this.turnResolve) {
-          const resolve = this.turnResolve;
-          this.turnResolve = null;
-          this.turnReject = null;
-          this.turnOnText = null;
-          resolve({
-            text: this.turnProseText,
-            fullText: this.turnFullText,
-            sessionId: this.sessionId,
-          });
-        }
-        return;
-      }
+      event = JSON.parse(line) as Record<string, unknown>;
     } catch {
-      // Skip unparseable lines
+      log.warn(`claude-process: unparseable line: ${line.slice(0, 200)}`);
+      return;
     }
+
+    const eventType = String(event.type ?? "unknown");
+
+    // Session init (also sent between turns)
+    if (eventType === "system" && event.subtype === "init") {
+      if (typeof event.session_id === "string") {
+        this.sessionId = event.session_id as string;
+        log.info(`claude-process: session init sid=${this.sessionId.slice(0, 12)}`);
+      }
+      return;
+    }
+
+    // Rate limit events
+    if (eventType === "rate_limit_event") {
+      const info = event.rate_limit_info as Record<string, unknown> | undefined;
+      const status = String(info?.status ?? "unknown");
+      if (status !== "allowed") {
+        log.warn(`claude-process: rate limit status=${status} info=${JSON.stringify(info)}`);
+      }
+      return;
+    }
+
+    // Streaming text delta — Claude's prose
+    if (eventType === "stream_event") {
+      const inner = event.event as Record<string, unknown> | undefined;
+      if (inner?.type === "content_block_delta") {
+        const delta = inner.delta as Record<string, unknown> | undefined;
+        if (delta?.type === "text_delta" && typeof delta.text === "string") {
+          const text = delta.text as string;
+          this.turnFullText += text;
+          this.turnProseText += text;
+          this.turnOnText?.(text);
+        }
+      }
+      return;
+    }
+
+    // Accumulated assistant message — extract tool_use content
+    if (eventType === "assistant") {
+      const msg = event.message as Record<string, unknown> | undefined;
+      const content = msg?.content as unknown[] | undefined;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          const b = block as Record<string, unknown>;
+          if (b.type === "tool_use" && typeof b.id === "string") {
+            if (this.emittedToolBlocks.has(b.id as string)) continue;
+            this.emittedToolBlocks.add(b.id as string);
+
+            const name = b.name as string;
+            const input = (b.input ?? {}) as Record<string, unknown>;
+
+            if (name === "AskUserQuestion") {
+              const formatted = formatAskUserQuestion(input);
+              if (formatted) this.turnFullText += formatted;
+            } else if (!INTERACTIVE_TOOLS.has(name)) {
+              const summary = summarizeToolInput(name, input);
+              const formatted = summary ? `\n[${name}] ${summary}\n` : `\n[${name}]\n`;
+              this.turnFullText += formatted;
+            }
+          }
+        }
+      }
+      return;
+    }
+
+    // Tool result
+    if (eventType === "user") {
+      const msg = event.message as Record<string, unknown> | undefined;
+      const content = msg?.content as unknown[] | undefined;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          const b = block as Record<string, unknown>;
+          if (b.type !== "tool_result") continue;
+
+          let resultText = "";
+          if (typeof b.content === "string") {
+            resultText = b.content;
+          } else if (Array.isArray(b.content)) {
+            resultText = (b.content as Record<string, unknown>[])
+              .filter((c) => c.type === "text" && typeof c.text === "string")
+              .map((c) => c.text as string)
+              .join("\n");
+          }
+
+          if (resultText.trim()) {
+            const maxLen = 800;
+            const truncated = resultText.length > maxLen
+              ? resultText.slice(0, maxLen) + `\n... (${resultText.length - maxLen} chars truncated)`
+              : resultText;
+            this.turnFullText += `\n📎 結果：\n${truncated}\n`;
+          }
+        }
+      }
+      return;
+    }
+
+    // Result event — turn is complete
+    if (eventType === "result") {
+      if (typeof event.session_id === "string") {
+        this.sessionId = event.session_id as string;
+      }
+
+      const costUsd = typeof event.total_cost_usd === "number"
+        ? (event.total_cost_usd as number).toFixed(4)
+        : "?";
+      const numTurns = event.num_turns ?? "?";
+      const durationMs = event.duration_ms ?? "?";
+
+      if (event.is_error || event.subtype === "error_during_execution") {
+        const errors = event.errors as string[] | undefined;
+        const errorMsg = errors?.join("; ") ?? String(event.result ?? "unknown error");
+        log.error(`claude-process: turn error: ${errorMsg}`);
+      }
+
+      log.info(
+        `claude-process: turn complete sid=${this.sessionId.slice(0, 12)} ` +
+        `proseLen=${this.turnProseText.length} fullLen=${this.turnFullText.length} ` +
+        `turns=${numTurns} cost=$${costUsd} dur=${durationMs}ms`,
+      );
+
+      this.completeTurn();
+      return;
+    }
+
+    // Catch-all — log unrecognized event types so they're not silently dropped
+    log.warn(`claude-process: unhandled event type="${eventType}" subtype="${event.subtype ?? ""}" keys=${Object.keys(event).join(",")}`);
   }
 
   /** Kill the process and respawn. */
@@ -368,6 +419,7 @@ export class ClaudeProcess {
       this.sessionId = "";
 
       // Reject any in-flight turn
+      this.clearTurnTimeout();
       if (this.turnReject) {
         this.turnReject(new Error("Claude process stopped"));
         this.turnResolve = null;
