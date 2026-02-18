@@ -112,6 +112,7 @@ export class ClaudeProcess {
       "--output-format", "stream-json",
       "--input-format", "stream-json",
       "--verbose",
+      "--include-partial-messages",
       "--dangerously-skip-permissions",
     ];
 
