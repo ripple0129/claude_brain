@@ -8,6 +8,7 @@ export type RunClaudeOptions = {
   claudePath?: string;
   mcpConfigPath?: string;
   onText?: (text: string) => void;
+  logger?: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void };
 };
 
 export type RunClaudeResult = {
@@ -173,6 +174,10 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunClaudeResult
   delete env.CLAUDECODE;
   env.CI = "true";
 
+  const log = opts.logger;
+  const mode = opts.sessionId ? `resume:${opts.sessionId.slice(0, 12)}` : "new";
+  log?.info(`claude-runner: spawning [${mode}] args=${argv.filter(a => a !== opts.message).join(" ")}`);
+
   return new Promise<RunClaudeResult>((resolve, reject) => {
     const child = spawn(claudePath, argv, {
       env,
@@ -281,7 +286,12 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunClaudeResult
     });
 
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
+      const text = chunk.toString();
+      stderr += text;
+      // Log stderr lines as they arrive for real-time diagnostics
+      for (const line of text.split("\n")) {
+        if (line.trim()) log?.warn(`claude-runner: [stderr] ${line.trim()}`);
+      }
     });
 
     const timer = setTimeout(() => {
@@ -318,8 +328,16 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunClaudeResult
         lineBuf = "";
       }
 
+      log?.info(
+        `claude-runner: [${mode}] exited code=${code} ` +
+        `sessionId=${sessionId ? sessionId.slice(0, 12) : "(none)"} ` +
+        `proseLen=${proseText.length} fullLen=${fullText.length} ` +
+        `stderrLen=${stderr.length}`,
+      );
+
       if (code !== 0) {
         const detail = resultError || stderr.trim() || "(no details)";
+        log?.error(`claude-runner: [${mode}] FAILED detail=${detail.slice(0, 300)}`);
         reject(
           new ClaudeExitError(
             `Claude CLI exited with code ${code}: ${detail}`,
@@ -331,6 +349,7 @@ export async function runClaude(opts: RunClaudeOptions): Promise<RunClaudeResult
       }
 
       if (!sessionId) {
+        log?.error(`claude-runner: [${mode}] no session_id in output`);
         reject(new ClaudeParseError("Claude CLI response missing session_id"));
         return;
       }
