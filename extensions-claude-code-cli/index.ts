@@ -48,10 +48,16 @@ function resolveMcpConfigPath(api: OpenClawPluginApi): string | undefined {
   return process.env.OPENCLAW_CLAUDE_MCP_CONFIG ?? undefined;
 }
 
+function arinovaChannelConfig(api: OpenClawPluginApi): Record<string, unknown> | undefined {
+  return api.config?.channels?.["openclaw-arinova-ai"] as Record<string, unknown> | undefined;
+}
+
 function resolveArinovaServerUrl(api: OpenClawPluginApi): string {
   const c = cfg(api);
   const arinova = c?.arinova as Record<string, unknown> | undefined;
   if (arinova?.serverUrl && typeof arinova.serverUrl === "string") return arinova.serverUrl;
+  const ch = arinovaChannelConfig(api);
+  if (ch?.apiUrl && typeof ch.apiUrl === "string") return ch.apiUrl;
   return process.env.ARINOVA_SERVER_URL ?? "wss://api.chat.arinova.ai";
 }
 
@@ -59,6 +65,8 @@ function resolveArinovaBotToken(api: OpenClawPluginApi): string {
   const c = cfg(api);
   const arinova = c?.arinova as Record<string, unknown> | undefined;
   if (arinova?.botToken && typeof arinova.botToken === "string") return arinova.botToken;
+  const ch = arinovaChannelConfig(api);
+  if (ch?.botToken && typeof ch.botToken === "string") return ch.botToken;
   return process.env.ARINOVA_BOT_TOKEN ?? "";
 }
 
