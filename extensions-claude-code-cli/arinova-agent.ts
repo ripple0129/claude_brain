@@ -23,10 +23,13 @@ export type ArinovaAgentServiceOptions = {
 export function createArinovaAgentService(opts: ArinovaAgentServiceOptions) {
   const { serverUrl, botToken, sessionStore, commandHandler, logger } = opts;
 
+  const skills = commandHandler.getSkills();
+  logger.info(`arinova-agent: registering ${skills.length} skills: ${skills.map(s => s.id).join(", ")}`);
+
   const agent = new ArinovaAgent({
     serverUrl,
     botToken,
-    skills: commandHandler.getSkills(),
+    skills,
   });
 
   agent.onTask(async (task) => {
