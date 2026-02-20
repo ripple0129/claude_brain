@@ -10,77 +10,27 @@ export type ClaudeProcessOptions = {
   claudePath?: string;
   mcpConfigPath?: string;
   systemPrompt?: string;
+  cwd?: string;
+  model?: string;
+  resumeSessionId?: string;
+  compact?: boolean;
+  env?: Record<string, string>;
   logger: Logger;
 };
 
 export type SendMessageResult = {
-  /** Prose-only text (no tool calls/results) — used for final message */
   text: string;
-  /** Full text including tool calls and results — used for image path scanning */
-  fullText: string;
   sessionId: string;
 };
 
-// Tools that produce user-facing interactive content
-const INTERACTIVE_TOOLS = new Set(["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"]);
-
 const DEFAULT_CLAUDE_PATH = "claude";
-const TURN_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes — safety net for stuck turns
-
-/**
- * Format AskUserQuestion tool input into readable text
- */
-function formatAskUserQuestion(input: Record<string, unknown>): string {
-  const questions = input.questions as Array<{
-    question: string;
-    options?: Array<{ label: string; description?: string }>;
-    multiSelect?: boolean;
-  }> | undefined;
-  if (!Array.isArray(questions) || questions.length === 0) return "";
-
-  const parts: string[] = ["\n---"];
-  for (const q of questions) {
-    parts.push(`\n**${q.question}**${q.multiSelect ? " (可多選)" : ""}`);
-    if (Array.isArray(q.options)) {
-      for (let i = 0; i < q.options.length; i++) {
-        const opt = q.options[i];
-        const desc = opt.description ? ` — ${opt.description}` : "";
-        parts.push(`${i + 1}. ${opt.label}${desc}`);
-      }
-    }
-  }
-  parts.push("\n---\n");
-  return parts.join("\n");
-}
-
-/**
- * Extract a short summary of the tool input for inline display.
- */
-function summarizeToolInput(name: string, input: Record<string, unknown>): string {
-  const key =
-    name === "Bash" ? "command"
-    : name === "Read" ? "file_path"
-    : name === "Write" ? "file_path"
-    : name === "Edit" ? "file_path"
-    : name === "Grep" ? "pattern"
-    : name === "Glob" ? "pattern"
-    : name === "WebFetch" ? "url"
-    : name === "WebSearch" ? "query"
-    : name === "Task" ? "description"
-    : null;
-
-  if (key && typeof input[key] === "string") {
-    const val = input[key] as string;
-    return val.length > 120 ? val.slice(0, 117) + "..." : val;
-  }
-  return "";
-}
+const TURN_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
  * Persistent Claude Code CLI process using the bidirectional stream-json protocol.
  *
- * Instead of spawning a new process per message, we keep a single long-running
- * `claude` process and send/receive newline-delimited JSON on stdin/stdout.
+ * Keeps a single long-running `claude` process and sends/receives
+ * newline-delimited JSON on stdin/stdout. Only prose text is tracked.
  */
 export class ClaudeProcess {
   private child: ChildProcess | null = null;
@@ -88,21 +38,20 @@ export class ClaudeProcess {
   private lineBuf = "";
   private sessionId = "";
   private alive = false;
+  private totalCostUsd = 0;
+  private stderrBuf: string[] = [];
 
-  // Per-turn state — reset on each sendMessage() call
+  // Per-turn state
   private turnResolve: ((result: SendMessageResult) => void) | null = null;
   private turnReject: ((err: Error) => void) | null = null;
   private turnProseText = "";
-  private turnFullText = "";
   private turnOnText: ((text: string) => void) | null = null;
-  private emittedToolBlocks = new Set<string>();
   private turnTimeout: ReturnType<typeof setTimeout> | null = null;
 
   constructor(opts: ClaudeProcessOptions) {
     this.opts = opts;
   }
 
-  /** Spawn the persistent process. */
   start(): void {
     if (this.child) return;
 
@@ -118,6 +67,10 @@ export class ClaudeProcess {
       "--dangerously-skip-permissions",
     ];
 
+    if (this.opts.model) {
+      argv.push("--model", this.opts.model);
+    }
+
     if (this.opts.mcpConfigPath) {
       argv.push("--mcp-config", this.opts.mcpConfigPath);
     }
@@ -126,14 +79,28 @@ export class ClaudeProcess {
       argv.push("--append-system-prompt", this.opts.systemPrompt);
     }
 
-    const env = { ...process.env };
+    if (this.opts.resumeSessionId) {
+      argv.push("--resume", this.opts.resumeSessionId);
+    }
+
+    if (this.opts.compact) {
+      argv.push("--compact");
+    }
+
+    const env = { ...process.env, ...this.opts.env };
     delete env.CLAUDECODE;
     env.CI = "true";
+    // Strip node_modules/.bin from PATH to avoid picking up local
+    // @anthropic-ai/claude-code binary which may be an incompatible version
+    if (env.PATH) {
+      env.PATH = env.PATH.split(":").filter((p) => !p.includes("node_modules/.bin")).join(":");
+    }
 
-    log.info(`claude-process: spawning persistent process args=${argv.filter(a => a !== "").join(" ")}`);
+    log.info(`claude-process: spawning args=${argv.filter(a => a !== "").join(" ")}`);
 
     const child = spawn(claudePath, argv, {
       env,
+      cwd: this.opts.cwd,
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -149,10 +116,15 @@ export class ClaudeProcess {
       }
     });
 
+    this.stderrBuf = [];
     child.stderr!.on("data", (chunk: Buffer) => {
       const text = chunk.toString();
       for (const line of text.split("\n")) {
-        if (line.trim()) log.warn(`claude-process: [stderr] ${line.trim()}`);
+        if (line.trim()) {
+          log.warn(`claude-process: [stderr] ${line.trim()}`);
+          this.stderrBuf.push(line.trim());
+          if (this.stderrBuf.length > 20) this.stderrBuf.shift();
+        }
       }
     });
 
@@ -169,19 +141,23 @@ export class ClaudeProcess {
     });
 
     child.on("close", (code) => {
+      const stderrTail = this.stderrBuf.join("\n");
       log.warn(`claude-process: process exited code=${code}`);
+      if (stderrTail) {
+        log.error(`claude-process: stderr output:\n${stderrTail}`);
+      }
       this.alive = false;
       this.child = null;
       this.clearTurnTimeout();
       if (this.turnReject) {
-        this.turnReject(new Error(`Claude process exited unexpectedly (code ${code})`));
+        const errDetail = stderrTail ? `\nstderr: ${stderrTail}` : "";
+        this.turnReject(new Error(`Claude process exited unexpectedly (code ${code})${errDetail}`));
         this.turnResolve = null;
         this.turnReject = null;
       }
     });
   }
 
-  /** Send a user message and wait for the complete response. */
   sendMessage(
     text: string,
     onText?: (text: string) => void,
@@ -196,21 +172,17 @@ export class ClaudeProcess {
       return Promise.reject(new Error("Another message is already in-flight"));
     }
 
-    // Reset per-turn state
     this.turnProseText = "";
-    this.turnFullText = "";
     this.turnOnText = onText ?? null;
-    this.emittedToolBlocks.clear();
 
     return new Promise<SendMessageResult>((resolve, reject) => {
       this.turnResolve = resolve;
       this.turnReject = reject;
 
-      // Safety timeout — if result never arrives, resolve with what we have
       this.turnTimeout = setTimeout(() => {
         log.error(
           `claude-process: turn timeout after ${TURN_TIMEOUT_MS / 1000}s ` +
-          `proseLen=${this.turnProseText.length} fullLen=${this.turnFullText.length}`,
+          `proseLen=${this.turnProseText.length}`,
         );
         this.completeTurn();
       }, TURN_TIMEOUT_MS);
@@ -234,7 +206,22 @@ export class ClaudeProcess {
     });
   }
 
-  /** Clear the per-turn timeout. */
+  /** Check if a turn is currently in progress. */
+  isBusy(): boolean {
+    return this.turnResolve !== null;
+  }
+
+  /** Abort the current in-flight turn without killing the process. */
+  abortTurn(): void {
+    if (!this.turnReject) return;
+    this.clearTurnTimeout();
+    const reject = this.turnReject;
+    this.turnResolve = null;
+    this.turnReject = null;
+    this.turnOnText = null;
+    reject(new Error("Turn aborted by user"));
+  }
+
   private clearTurnTimeout(): void {
     if (this.turnTimeout) {
       clearTimeout(this.turnTimeout);
@@ -242,7 +229,6 @@ export class ClaudeProcess {
     }
   }
 
-  /** Resolve the current turn with accumulated text. */
   private completeTurn(): void {
     this.clearTurnTimeout();
     if (this.turnResolve) {
@@ -252,13 +238,11 @@ export class ClaudeProcess {
       this.turnOnText = null;
       resolve({
         text: this.turnProseText,
-        fullText: this.turnFullText,
         sessionId: this.sessionId,
       });
     }
   }
 
-  /** Process a single line of stdout JSON. */
   private processLine(line: string): void {
     if (!line.trim()) return;
 
@@ -273,7 +257,6 @@ export class ClaudeProcess {
 
     const eventType = String(event.type ?? "unknown");
 
-    // Session init (also sent between turns)
     if (eventType === "system" && event.subtype === "init") {
       if (typeof event.session_id === "string") {
         this.sessionId = event.session_id as string;
@@ -282,7 +265,6 @@ export class ClaudeProcess {
       return;
     }
 
-    // Rate limit events
     if (eventType === "rate_limit_event") {
       const info = event.rate_limit_info as Record<string, unknown> | undefined;
       const status = String(info?.status ?? "unknown");
@@ -292,14 +274,13 @@ export class ClaudeProcess {
       return;
     }
 
-    // Streaming text delta — Claude's prose
+    // Streaming text delta — Claude's prose (only thing we send to chat)
     if (eventType === "stream_event") {
       const inner = event.event as Record<string, unknown> | undefined;
       if (inner?.type === "content_block_delta") {
         const delta = inner.delta as Record<string, unknown> | undefined;
         if (delta?.type === "text_delta" && typeof delta.text === "string") {
           const text = delta.text as string;
-          this.turnFullText += text;
           this.turnProseText += text;
           this.turnOnText?.(text);
         }
@@ -307,62 +288,8 @@ export class ClaudeProcess {
       return;
     }
 
-    // Accumulated assistant message — extract tool_use content
-    if (eventType === "assistant") {
-      const msg = event.message as Record<string, unknown> | undefined;
-      const content = msg?.content as unknown[] | undefined;
-      if (Array.isArray(content)) {
-        for (const block of content) {
-          const b = block as Record<string, unknown>;
-          if (b.type === "tool_use" && typeof b.id === "string") {
-            if (this.emittedToolBlocks.has(b.id as string)) continue;
-            this.emittedToolBlocks.add(b.id as string);
-
-            const name = b.name as string;
-            const input = (b.input ?? {}) as Record<string, unknown>;
-
-            if (name === "AskUserQuestion") {
-              const formatted = formatAskUserQuestion(input);
-              if (formatted) this.turnFullText += formatted;
-            } else if (!INTERACTIVE_TOOLS.has(name)) {
-              const summary = summarizeToolInput(name, input);
-              const formatted = summary ? `\n[${name}] ${summary}\n` : `\n[${name}]\n`;
-              this.turnFullText += formatted;
-            }
-          }
-        }
-      }
-      return;
-    }
-
-    // Tool result
-    if (eventType === "user") {
-      const msg = event.message as Record<string, unknown> | undefined;
-      const content = msg?.content as unknown[] | undefined;
-      if (Array.isArray(content)) {
-        for (const block of content) {
-          const b = block as Record<string, unknown>;
-          if (b.type !== "tool_result") continue;
-
-          let resultText = "";
-          if (typeof b.content === "string") {
-            resultText = b.content;
-          } else if (Array.isArray(b.content)) {
-            resultText = (b.content as Record<string, unknown>[])
-              .filter((c) => c.type === "text" && typeof c.text === "string")
-              .map((c) => c.text as string)
-              .join("\n");
-          }
-
-          if (resultText.trim()) {
-            const maxLen = 800;
-            const truncated = resultText.length > maxLen
-              ? resultText.slice(0, maxLen) + `\n... (${resultText.length - maxLen} chars truncated)`
-              : resultText;
-            this.turnFullText += `\n📎 結果：\n${truncated}\n`;
-          }
-        }
-      }
+    // Silently skip tool calls and tool results (prose-only strategy)
+    if (eventType === "assistant" || eventType === "user") {
       return;
     }
 
@@ -370,6 +297,10 @@ export class ClaudeProcess {
     if (eventType === "result") {
       if (typeof event.session_id === "string") {
         this.sessionId = event.session_id as string;
+      }
+
+      if (typeof event.total_cost_usd === "number") {
+        this.totalCostUsd += event.total_cost_usd as number;
       }
 
       const costUsd = typeof event.total_cost_usd === "number"
@@ -383,9 +314,8 @@ export class ClaudeProcess {
         const errorMsg = errors?.join("; ") ?? String(event.result ?? "unknown error");
         log.error(`claude-process: turn error: ${errorMsg}`);
 
-        // API/server errors with no useful output → reject so bridge can retry
         if (!this.turnProseText.trim()) {
-          log.warn("claude-process: error with no prose output, rejecting for retry");
+          log.warn("claude-process: error with no prose output, rejecting");
           this.clearTurnTimeout();
           if (this.turnReject) {
             const reject = this.turnReject;
@@ -400,7 +330,7 @@ export class ClaudeProcess {
 
       log.info(
         `claude-process: turn complete sid=${this.sessionId.slice(0, 12)} ` +
-        `proseLen=${this.turnProseText.length} fullLen=${this.turnFullText.length} ` +
+        `proseLen=${this.turnProseText.length} ` +
         `turns=${numTurns} cost=$${costUsd} dur=${durationMs}ms`,
       );
 
@@ -408,18 +338,15 @@ export class ClaudeProcess {
       return;
     }
 
-    // Catch-all — log unrecognized event types so they're not silently dropped
-    log.warn(`claude-process: unhandled event type="${eventType}" subtype="${event.subtype ?? ""}" keys=${Object.keys(event).join(",")}`);
+    log.warn(`claude-process: unhandled event type="${eventType}" subtype="${event.subtype ?? ""}"`);
   }
 
-  /** Kill the process and respawn. */
   async restart(): Promise<void> {
     this.opts.logger.info("claude-process: restarting...");
     await this.stop();
     this.start();
   }
 
-  /** Kill the process. */
   stop(): Promise<void> {
     return new Promise((resolve) => {
       if (!this.child) {
@@ -430,9 +357,7 @@ export class ClaudeProcess {
       const child = this.child;
       this.child = null;
       this.alive = false;
-      this.sessionId = "";
 
-      // Reject any in-flight turn
       this.clearTurnTimeout();
       if (this.turnReject) {
         this.turnReject(new Error("Claude process stopped"));
@@ -443,7 +368,6 @@ export class ClaudeProcess {
       child.on("close", () => resolve());
       child.kill("SIGTERM");
 
-      // Force kill after 5s
       setTimeout(() => {
         if (!child.killed) {
           child.kill("SIGKILL");
@@ -459,5 +383,17 @@ export class ClaudeProcess {
 
   getSessionId(): string {
     return this.sessionId;
+  }
+
+  getTotalCost(): number {
+    return this.totalCostUsd;
+  }
+
+  getCwd(): string | undefined {
+    return this.opts.cwd;
+  }
+
+  getModel(): string | undefined {
+    return this.opts.model;
   }
 }

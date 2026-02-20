@@ -4,18 +4,30 @@ import type {
   ProviderAuthContext,
   ProviderAuthResult,
 } from "openclaw/plugin-sdk";
+import { homedir } from "node:os";
+import path from "node:path";
 import { createBridgeServer } from "./bridge-server.js";
+import { SessionStore } from "./session-store.js";
+import { CommandHandler } from "./command-handler.js";
+import { createArinovaAgentService } from "./arinova-agent.js";
 
 const DEFAULT_PORT = 18810;
 const DEFAULT_CLAUDE_PATH = "claude";
-const DEFAULT_TIMEOUT_MS = 300_000;
+const DEFAULT_CWD = path.join(homedir(), "projects");
+const DEFAULT_MAX_SESSIONS = 5;
+const DEFAULT_IDLE_TIMEOUT_MS = 600_000; // 10 minutes
 
 const CONTEXT_WINDOW = 200_000;
 const MAX_TOKENS = 16_384;
 
+type PluginCfg = Record<string, unknown> | undefined;
+function cfg(api: OpenClawPluginApi): PluginCfg {
+  return api.pluginConfig as PluginCfg;
+}
+
 function resolvePort(api: OpenClawPluginApi): number {
-  const cfg = api.pluginConfig as Record<string, unknown> | undefined;
-  if (cfg?.port && typeof cfg.port === "number") return cfg.port;
+  const c = cfg(api);
+  if (c?.port && typeof c.port === "number") return c.port;
   const envPort = process.env.OPENCLAW_CLAUDE_CLI_PORT;
   if (envPort) {
     const n = Number.parseInt(envPort, 10);
@@ -25,21 +37,64 @@ function resolvePort(api: OpenClawPluginApi): number {
 }
 
 function resolveClaudePath(api: OpenClawPluginApi): string {
-  const cfg = api.pluginConfig as Record<string, unknown> | undefined;
-  if (cfg?.claudePath && typeof cfg.claudePath === "string") return cfg.claudePath;
+  const c = cfg(api);
+  if (c?.claudePath && typeof c.claudePath === "string") return c.claudePath;
   return process.env.CLAUDE_PATH ?? DEFAULT_CLAUDE_PATH;
 }
 
-function resolveTimeoutMs(api: OpenClawPluginApi): number {
-  const cfg = api.pluginConfig as Record<string, unknown> | undefined;
-  if (cfg?.timeoutMs && typeof cfg.timeoutMs === "number") return cfg.timeoutMs;
-  return DEFAULT_TIMEOUT_MS;
+function resolveMcpConfigPath(api: OpenClawPluginApi): string | undefined {
+  const c = cfg(api);
+  if (c?.mcpConfigPath && typeof c.mcpConfigPath === "string") return c.mcpConfigPath;
+  return process.env.OPENCLAW_CLAUDE_MCP_CONFIG ?? undefined;
 }
 
-function resolveMcpConfigPath(api: OpenClawPluginApi): string | undefined {
-  const cfg = api.pluginConfig as Record<string, unknown> | undefined;
-  if (cfg?.mcpConfigPath && typeof cfg.mcpConfigPath === "string") return cfg.mcpConfigPath;
-  return process.env.OPENCLAW_CLAUDE_MCP_CONFIG ?? undefined;
+function resolveArinovaServerUrl(api: OpenClawPluginApi): string {
+  const c = cfg(api);
+  const arinova = c?.arinova as Record<string, unknown> | undefined;
+  if (arinova?.serverUrl && typeof arinova.serverUrl === "string") return arinova.serverUrl;
+  return process.env.ARINOVA_SERVER_URL ?? "wss://api.chat.arinova.ai";
+}
+
+function resolveArinovaBotToken(api: OpenClawPluginApi): string {
+  const c = cfg(api);
+  const arinova = c?.arinova as Record<string, unknown> | undefined;
+  if (arinova?.botToken && typeof arinova.botToken === "string") return arinova.botToken;
+  return process.env.ARINOVA_BOT_TOKEN ?? "";
+}
+
+function resolveDefaultCwd(api: OpenClawPluginApi): string {
+  const c = cfg(api);
+  const defaults = c?.defaults as Record<string, unknown> | undefined;
+  if (defaults?.cwd && typeof defaults.cwd === "string") {
+    return defaults.cwd.replace(/^~/, homedir());
+  }
+  const envCwd = process.env.DEFAULT_CWD;
+  if (envCwd) return envCwd.replace(/^~/, homedir());
+  return DEFAULT_CWD;
+}
+
+function resolveMaxSessions(api: OpenClawPluginApi): number {
+  const c = cfg(api);
+  const defaults = c?.defaults as Record<string, unknown> | undefined;
+  if (defaults?.maxSessions && typeof defaults.maxSessions === "number") return defaults.maxSessions;
+  const envVal = process.env.MAX_SESSIONS;
+  if (envVal) {
+    const n = Number.parseInt(envVal, 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return DEFAULT_MAX_SESSIONS;
+}
+
+function resolveIdleTimeoutMs(api: OpenClawPluginApi): number {
+  const c = cfg(api);
+  const defaults = c?.defaults as Record<string, unknown> | undefined;
+  if (defaults?.idleTimeoutMs && typeof defaults.idleTimeoutMs === "number") return defaults.idleTimeoutMs;
+  const envVal = process.env.IDLE_TIMEOUT_MS;
+  if (envVal) {
+    const n = Number.parseInt(envVal, 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return DEFAULT_IDLE_TIMEOUT_MS;
 }
 
 const plugin = {
@@ -49,6 +104,8 @@ const plugin = {
 
   register(api: OpenClawPluginApi) {
     let bridge: ReturnType<typeof createBridgeServer> | null = null;
+    let arinovaAgent: ReturnType<typeof createArinovaAgentService> | null = null;
+    let sessionStore: SessionStore | null = null;
 
     // --- Provider registration ---
     api.registerProvider({
@@ -136,24 +193,61 @@ const plugin = {
       start: async (ctx) => {
         const port = resolvePort(api);
         const claudePath = resolveClaudePath(api);
-        const timeoutMs = resolveTimeoutMs(api);
         const mcpConfigPath = resolveMcpConfigPath(api);
+        const defaultCwd = resolveDefaultCwd(api);
+        const maxSessions = resolveMaxSessions(api);
+        const idleTimeoutMs = resolveIdleTimeoutMs(api);
 
+        // Create shared SessionStore and CommandHandler
+        sessionStore = new SessionStore(
+          { claudePath, mcpConfigPath, defaultCwd, maxSessions, idleTimeoutMs },
+          ctx.logger,
+        );
+        const commandHandler = new CommandHandler(sessionStore, { defaultCwd });
+
+        // Start HTTP bridge
         bridge = createBridgeServer({
           port,
-          stateDir: ctx.stateDir,
-          claudePath,
-          timeoutMs,
-          mcpConfigPath,
+          sessionStore,
+          commandHandler,
           logger: ctx.logger,
         });
-
         await bridge.start();
+
+        // Start Arinova agent (optional — skip if no bot token)
+        const botToken = resolveArinovaBotToken(api);
+        if (botToken) {
+          const serverUrl = resolveArinovaServerUrl(api);
+          arinovaAgent = createArinovaAgentService({
+            serverUrl,
+            botToken,
+            sessionStore,
+            commandHandler,
+            logger: ctx.logger,
+          });
+          try {
+            await arinovaAgent.start();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            ctx.logger.error(`arinova-agent: failed to connect: ${msg}`);
+            arinovaAgent = null;
+          }
+        } else {
+          ctx.logger.info("arinova-agent: no bot token configured, skipping");
+        }
       },
       stop: async () => {
+        if (arinovaAgent) {
+          arinovaAgent.stop();
+          arinovaAgent = null;
+        }
         if (bridge) {
           await bridge.stop();
           bridge = null;
+        }
+        if (sessionStore) {
+          await sessionStore.stopAll();
+          sessionStore = null;
         }
       },
     };

@@ -1,16 +1,22 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { ClaudeProcess } from "./claude-process.js";
+import type { SessionStore } from "./session-store.js";
+import type { CommandHandler } from "./command-handler.js";
 import { findAndUploadImages, replaceImagePaths } from "./image-replacer.js";
+
+type Logger = {
+  info: (msg: string) => void;
+  warn: (msg: string) => void;
+  error: (msg: string) => void;
+};
 
 type BridgeOptions = {
   port: number;
-  stateDir: string;
-  claudePath?: string;
-  timeoutMs?: number;
-  mcpConfigPath?: string;
-  systemPrompt?: string;
-  logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void };
+  sessionStore: SessionStore;
+  commandHandler: CommandHandler;
+  logger: Logger;
 };
+
+const DEBUG_CONVERSATION_ID = "debug";
 
 type ContentBlock = { type: string; text?: string };
 type MessageContent = string | ContentBlock[];
@@ -37,7 +43,6 @@ function createMutex() {
   return {
     run<T>(fn: () => Promise<T>): Promise<T> {
       const next = pending.then(() => fn());
-      // Swallow errors so future callers aren't blocked
       pending = next.then(() => {}, () => {});
       return next;
     },
@@ -52,16 +57,6 @@ function extractLatestUserMsg(messages: ChatMessage[]): string {
     }
   }
   return latestUserMsg;
-}
-
-function extractSystemPrompt(messages: ChatMessage[]): string {
-  const parts: string[] = [];
-  for (const msg of messages) {
-    if (msg.role === "system") {
-      parts.push(contentToString(msg.content));
-    }
-  }
-  return parts.join("\n");
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -143,25 +138,9 @@ function openAiError(message: string, type: string, code: string | null = null):
 }
 
 export function createBridgeServer(opts: BridgeOptions) {
-  const { port, claudePath, mcpConfigPath, logger } = opts;
+  const { port, sessionStore, commandHandler, logger } = opts;
   const mutex = createMutex();
   let server: Server | null = null;
-  let claude: ClaudeProcess | null = null;
-
-  /** Ensure the persistent Claude process is running. */
-  function ensureProcess(systemPrompt?: string): ClaudeProcess {
-    if (claude && claude.isAlive()) return claude;
-
-    logger.info("claude-code-cli: starting persistent Claude process...");
-    claude = new ClaudeProcess({
-      claudePath,
-      mcpConfigPath,
-      systemPrompt,
-      logger,
-    });
-    claude.start();
-    return claude;
-  }
 
   async function handleCompletions(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method !== "POST") {
@@ -190,7 +169,6 @@ export function createBridgeServer(opts: BridgeOptions) {
     const model = typeof body.model === "string" ? body.model : "claude-code-cli";
     const isStreaming = body.stream !== false;
     const latestUserMsg = extractLatestUserMsg(messages);
-    const systemPrompt = extractSystemPrompt(messages);
 
     if (!latestUserMsg) {
       jsonResponse(res, 400, openAiError("No user message found", "invalid_request_error"));
@@ -198,36 +176,46 @@ export function createBridgeServer(opts: BridgeOptions) {
     }
 
     logger.info(
-      `claude-code-cli: request — msgs=${messages.length} msg="${latestUserMsg.slice(0, 80)}${latestUserMsg.length > 80 ? "..." : ""}"`,
+      `bridge: request — msgs=${messages.length} msg="${latestUserMsg.slice(0, 80)}${latestUserMsg.length > 80 ? "..." : ""}"`,
     );
 
-    // Handle /new or /reset — restart the persistent process
-    const trimmed = latestUserMsg.trim().toLowerCase();
-    if (trimmed === "/new" || trimmed === "/reset") {
-      logger.info("claude-code-cli: restarting process (user requested /new)");
-      if (claude) {
-        await claude.restart();
+    // Try command handling first (handles /new, /reset, etc.)
+    if (latestUserMsg.trim().startsWith("/")) {
+      let cmdReply = "";
+      const cmdResult = await commandHandler.handle(latestUserMsg, {
+        conversationId: DEBUG_CONVERSATION_ID,
+        sendChunk: (text) => { cmdReply = text; },
+        sendComplete: (text) => { cmdReply = text; },
+        sendError: (text) => { cmdReply = `Error: ${text}`; },
+      });
+      if (cmdResult.handled) {
+        if (isStreaming) {
+          sseFullMessage(res, cmdReply, model);
+        } else {
+          jsonResponse(res, 200, {
+            id: `chatcmpl-${Date.now()}`,
+            object: "chat.completion",
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [{ index: 0, message: { role: "assistant", content: cmdReply }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+          });
+        }
+        return;
       }
-      const reply = "Session cleared. Starting a new conversation.";
-      if (isStreaming) {
-        sseFullMessage(res, reply, model);
-      } else {
-        jsonResponse(res, 200, {
-          id: `chatcmpl-${Date.now()}`,
-          object: "chat.completion",
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [{ index: 0, message: { role: "assistant", content: reply }, finish_reason: "stop" }],
-          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-        });
-      }
-      return;
     }
 
     try {
       const result = await mutex.run(async () => {
-        // Ensure persistent process is running (lazy start with system prompt)
-        const proc = ensureProcess(systemPrompt || undefined);
+        // Ensure session exists for debug conversation
+        let entry = sessionStore.getSession(DEBUG_CONVERSATION_ID);
+        if (!entry || !entry.process.isAlive()) {
+          const cwd = commandHandler.getCwdForConversation(DEBUG_CONVERSATION_ID);
+          const sessionModel = commandHandler.getModelForConversation(DEBUG_CONVERSATION_ID);
+          entry = sessionStore.createSession(DEBUG_CONVERSATION_ID, { cwd, model: sessionModel });
+        } else {
+          entry.lastActivity = Date.now();
+        }
 
         const sseId = `chatcmpl-${Date.now()}`;
         const sseCreated = Math.floor(Date.now() / 1000);
@@ -249,28 +237,27 @@ export function createBridgeServer(opts: BridgeOptions) {
 
         let out;
         try {
-          out = await proc.sendMessage(latestUserMsg, onText);
+          out = await entry.process.sendMessage(latestUserMsg, onText);
         } catch (err) {
-          // Process died or errored — try once more with a fresh process
           const errMsg = err instanceof Error ? err.message : String(err);
-          logger.warn(`claude-code-cli: sendMessage failed: ${errMsg}, restarting process...`);
-          await proc.restart();
-          out = await proc.sendMessage(latestUserMsg, onText);
+          logger.warn(`bridge: sendMessage failed: ${errMsg}, restarting process...`);
+          await entry.process.restart();
+          out = await entry.process.sendMessage(latestUserMsg, onText);
         }
 
         if (keepAliveTimer) clearInterval(keepAliveTimer);
 
-        // Upload any local image files
+        // Upload any local image files (scan prose text)
         if (isStreaming && out) {
           const workDir = process.env.OPENCLAW_WORKSPACE
             ?? `${process.env.HOME}/.openclaw/workspace`;
           try {
-            const urls = await findAndUploadImages(out.fullText, workDir, logger);
+            const urls = await findAndUploadImages(out.text, workDir, logger);
             for (const url of urls) {
               sseDelta(res, sseId, sseCreated, model, `\n\n![image](${url})`);
             }
           } catch (err) {
-            logger.warn(`claude-code-cli: image upload failed: ${err}`);
+            logger.warn(`bridge: image upload failed: ${err}`);
           }
         }
 
@@ -300,7 +287,7 @@ export function createBridgeServer(opts: BridgeOptions) {
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
-      logger.error(`claude-code-cli: REQUEST ERROR msg=${message}`);
+      logger.error(`bridge: REQUEST ERROR msg=${message}`);
 
       if (isStreaming) {
         sseError(res, message);
@@ -315,7 +302,7 @@ export function createBridgeServer(opts: BridgeOptions) {
 
     if (url === "/v1/chat/completions") {
       handleCompletions(req, res).catch((err) => {
-        logger.error(`claude-code-cli: unhandled error: ${err}`);
+        logger.error(`bridge: unhandled error: ${err}`);
         if (!res.headersSent) {
           jsonResponse(res, 500, openAiError("Internal server error", "server_error"));
         }
@@ -343,7 +330,7 @@ export function createBridgeServer(opts: BridgeOptions) {
         server.on("error", (err: NodeJS.ErrnoException) => {
           if (err.code === "EADDRINUSE") {
             logger.error(
-              `claude-code-cli: port ${port} is already in use, bridge not started`,
+              `bridge: port ${port} is already in use, bridge not started`,
             );
             server = null;
             resolve();
@@ -353,17 +340,13 @@ export function createBridgeServer(opts: BridgeOptions) {
         });
 
         server.listen(port, "127.0.0.1", () => {
-          logger.info(`claude-code-cli bridge started on port ${port}`);
+          logger.info(`bridge: HTTP bridge started on port ${port}`);
           resolve();
         });
       });
     },
 
-    async stop(): Promise<void> {
-      if (claude) {
-        await claude.stop();
-        claude = null;
-      }
+    stop(): Promise<void> {
       return new Promise((resolve) => {
         if (!server) {
           resolve();
