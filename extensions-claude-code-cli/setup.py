@@ -151,7 +151,7 @@ def verify_prerequisites() -> None:
         issues.append(f"{OPENCLAW_CONFIG} not found. Run `openclaw` first to onboard.")
 
     # Check extension files exist
-    required = ["index.ts", "bridge-server.ts", "claude-runner.ts", "session-store.ts",
+    required = ["index.ts", "bridge-server.ts", "claude-process.ts",
                 "package.json", "openclaw.plugin.json"]
     missing = [f for f in required if not (EXTENSION_DIR / f).exists()]
     if missing:

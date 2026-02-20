@@ -382,6 +382,20 @@ export class ClaudeProcess {
         const errors = event.errors as string[] | undefined;
         const errorMsg = errors?.join("; ") ?? String(event.result ?? "unknown error");
         log.error(`claude-process: turn error: ${errorMsg}`);
+
+        // API/server errors with no useful output → reject so bridge can retry
+        if (!this.turnProseText.trim()) {
+          log.warn("claude-process: error with no prose output, rejecting for retry");
+          this.clearTurnTimeout();
+          if (this.turnReject) {
+            const reject = this.turnReject;
+            this.turnResolve = null;
+            this.turnReject = null;
+            this.turnOnText = null;
+            reject(new Error(`Claude turn error: ${errorMsg}`));
+          }
+          return;
+        }
       }
 
       log.info(
