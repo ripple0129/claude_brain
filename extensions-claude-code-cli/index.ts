@@ -13,7 +13,7 @@ import { createArinovaAgentService } from "./arinova-agent.js";
 
 const DEFAULT_PORT = 18810;
 const DEFAULT_CLAUDE_PATH = "claude";
-const DEFAULT_CWD = path.join(homedir(), "projects");
+const DEFAULT_CWD = path.join(homedir(), ".openclaw", "workspace");
 const DEFAULT_MAX_SESSIONS = 5;
 const DEFAULT_IDLE_TIMEOUT_MS = 600_000; // 10 minutes
 
