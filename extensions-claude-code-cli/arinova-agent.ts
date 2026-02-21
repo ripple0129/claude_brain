@@ -34,6 +34,7 @@ export function createArinovaAgentService(opts: ArinovaAgentServiceOptions) {
 
   agent.onTask(async (task) => {
     const { conversationId, content } = task;
+    logger.info(`arinova-agent: task received conv=${conversationId} len=${content.length}`);
 
     // Try command handling first
     const result = await commandHandler.handle(content, {
@@ -49,8 +50,10 @@ export function createArinovaAgentService(opts: ArinovaAgentServiceOptions) {
       let entry = sessionStore.getSession(conversationId);
 
       if (entry && entry.process.isAlive()) {
+        logger.info(`arinova-agent: reusing session for ${conversationId} (alive, busy=${entry.process.isBusy()})`);
         entry.lastActivity = Date.now();
       } else {
+        logger.info(`arinova-agent: creating new session for ${conversationId} (old=${entry ? "dead" : "none"})`);
         const cwd = commandHandler.getCwdForConversation(conversationId);
         const model = commandHandler.getModelForConversation(conversationId);
         entry = sessionStore.createSession(conversationId, { cwd, model });
