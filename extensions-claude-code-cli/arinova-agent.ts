@@ -27,17 +27,18 @@ async function fileExists(p: string): Promise<boolean> {
 
 /**
  * Scan response text for local image paths, upload via task.uploadFile,
- * and send markdown image links as chunks.
+ * replace paths in text with markdown image links, and return modified text.
  */
 async function uploadResponseImages(
   text: string,
   workDir: string,
   task: TaskContext,
   logger: Logger,
-): Promise<void> {
+): Promise<string> {
   const matches = text.match(IMAGE_PATH_RE);
-  if (!matches) return;
+  if (!matches) return text;
 
+  let result = text;
   const uniquePaths = [...new Set(matches)];
   for (const rawPath of uniquePaths) {
     const absPath = isAbsolute(rawPath) ? rawPath : resolve(workDir, rawPath);
@@ -46,13 +47,14 @@ async function uploadResponseImages(
     try {
       const data = await readFile(absPath);
       const fileName = basename(absPath);
-      const result = await task.uploadFile(new Uint8Array(data), fileName);
-      logger.info(`arinova-agent: uploaded image ${fileName} → ${result.url}`);
-      task.sendChunk(`\n\n![${fileName}](${result.url})`);
+      const uploaded = await task.uploadFile(new Uint8Array(data), fileName);
+      logger.info(`arinova-agent: uploaded image ${fileName} → ${uploaded.url}`);
+      result = result.split(rawPath).join(`![${fileName}](${uploaded.url})`);
     } catch (err) {
       logger.warn(`arinova-agent: image upload failed for ${absPath}: ${err}`);
     }
   }
+  return result;
 }
 
 /**
@@ -138,15 +140,16 @@ export function createArinovaAgentService(opts: ArinovaAgentServiceOptions) {
         );
       }
 
-      // Upload any local images found in the response
+      // Upload any local images found in the response and replace paths with URLs
+      let finalText = sendResult.text;
       const workDir = entry.cwd || process.env.HOME + "/.openclaw/workspace";
       try {
-        await uploadResponseImages(sendResult.text, workDir, task, logger);
+        finalText = await uploadResponseImages(finalText, workDir, task, logger);
       } catch (err) {
         logger.warn(`arinova-agent: image upload scan failed: ${err}`);
       }
 
-      task.sendComplete(sendResult.text);
+      task.sendComplete(finalText);
     } catch (err) {
       // Don't report error if it was a cancellation
       if (task.signal.aborted) return;
