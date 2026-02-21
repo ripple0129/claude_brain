@@ -25,6 +25,25 @@ async function fileExists(p: string): Promise<boolean> {
   try { await access(p); return true; } catch { return false; }
 }
 
+async function uploadWithRetry(
+  task: TaskContext,
+  data: Uint8Array,
+  fileName: string,
+  retries = 3,
+): Promise<{ url: string }> {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await task.uploadFile(data, fileName);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isRetryable = msg.includes("503") || msg.includes("502") || msg.includes("429");
+      if (!isRetryable || attempt === retries) throw err;
+      await new Promise((r) => setTimeout(r, 1000 * attempt));
+    }
+  }
+  throw new Error("upload retries exhausted");
+}
+
 /**
  * Scan response text for local image paths, upload via task.uploadFile,
  * replace paths in text with markdown image links, and return modified text.
@@ -47,7 +66,7 @@ async function uploadResponseImages(
     try {
       const data = await readFile(absPath);
       const fileName = basename(absPath);
-      const uploaded = await task.uploadFile(new Uint8Array(data), fileName);
+      const uploaded = await uploadWithRetry(task, new Uint8Array(data), fileName);
       logger.info(`arinova-agent: uploaded image ${fileName} → ${uploaded.url}`);
       result = result.split(rawPath).join(`![${fileName}](${uploaded.url})`);
     } catch (err) {
