@@ -1,4 +1,6 @@
 import { ArinovaAgent } from "@arinova-ai/agent-sdk";
+import { readFile, access } from "node:fs/promises";
+import { resolve, isAbsolute, basename } from "node:path";
 import type { SessionStore } from "./session-store.js";
 import type { CommandHandler } from "./command-handler.js";
 
@@ -15,6 +17,45 @@ export type ArinovaAgentServiceOptions = {
   commandHandler: CommandHandler;
   logger: Logger;
 };
+
+const IMAGE_PATH_RE = /(?:(?:\/[\w.@~ -]+)+|(?:[\w.-]+\/)+[\w.-]+)\.(?:png|jpe?g|gif|webp)\b/gi;
+
+async function fileExists(p: string): Promise<boolean> {
+  try { await access(p); return true; } catch { return false; }
+}
+
+/**
+ * Scan response text for local image paths, upload via agent.uploadFile,
+ * replace paths in text with markdown image links, and return modified text.
+ */
+async function replaceImagePaths(
+  text: string,
+  workDir: string,
+  conversationId: string,
+  agent: ArinovaAgent,
+  logger: Logger,
+): Promise<string> {
+  const matches = text.match(IMAGE_PATH_RE);
+  if (!matches) return text;
+
+  let result = text;
+  const uniquePaths = [...new Set(matches)];
+  for (const rawPath of uniquePaths) {
+    const absPath = isAbsolute(rawPath) ? rawPath : resolve(workDir, rawPath);
+    if (!(await fileExists(absPath))) continue;
+
+    try {
+      const data = await readFile(absPath);
+      const fileName = basename(absPath);
+      const uploaded = await agent.uploadFile(conversationId, new Uint8Array(data), fileName);
+      logger.info(`arinova-agent: uploaded ${fileName} → ${uploaded.url}`);
+      result = result.split(rawPath).join(uploaded.url);
+    } catch (err) {
+      logger.warn(`arinova-agent: image upload failed for ${absPath}: ${err}`);
+    }
+  }
+  return result;
+}
 
 /**
  * Creates and manages the Arinova Chat agent connection.
@@ -99,7 +140,16 @@ export function createArinovaAgentService(opts: ArinovaAgentServiceOptions) {
         );
       }
 
-      task.sendComplete(sendResult.text);
+      // Replace local image paths with uploaded URLs
+      let finalText = sendResult.text;
+      const workDir = entry.cwd || process.env.HOME + "/.openclaw/workspace";
+      try {
+        finalText = await replaceImagePaths(finalText, workDir, conversationId, agent, logger);
+      } catch (err) {
+        logger.warn(`arinova-agent: image path replacement failed: ${err}`);
+      }
+
+      task.sendComplete(finalText);
     } catch (err) {
       // Don't report error if it was a cancellation
       if (task.signal.aborted) return;
