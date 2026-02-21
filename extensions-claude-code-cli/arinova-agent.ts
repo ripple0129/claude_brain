@@ -49,7 +49,10 @@ async function replaceImagePaths(
       const fileName = basename(absPath);
       const uploaded = await agent.uploadFile(conversationId, new Uint8Array(data), fileName);
       logger.info(`arinova-agent: uploaded ${fileName} → ${uploaded.url}`);
-      result = result.split(rawPath).join(`![${fileName}](${uploaded.url})`);
+      const mdImage = `![${fileName}](${uploaded.url})`;
+      // Strip surrounding backticks so markdown image renders instead of <code>
+      result = result.replaceAll(`\`${rawPath}\``, mdImage);
+      result = result.replaceAll(rawPath, mdImage);
     } catch (err) {
       logger.warn(`arinova-agent: image upload failed for ${absPath}: ${err}`);
     }
