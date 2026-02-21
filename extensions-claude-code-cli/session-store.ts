@@ -78,6 +78,17 @@ export class SessionStore {
     return this.config.codexModels.has(model) ? "codex" : "claude";
   }
 
+  /** List all available models with their backend type. */
+  listModels(): Array<{ id: string; backend: Backend }> {
+    const models: Array<{ id: string; backend: Backend }> = [
+      { id: "claude-code-cli", backend: "claude" },
+    ];
+    for (const m of this.config.codexModels) {
+      models.push({ id: m, backend: "codex" });
+    }
+    return models;
+  }
+
   createSession(conversationId: string, opts?: CreateSessionOpts): SessionEntry {
     this.enforceMaxSessions();
 

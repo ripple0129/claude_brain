@@ -26,8 +26,6 @@ const DEFAULT_CODEX_MODELS = [
   "gpt-5.3-codex",
   "gpt-5.3-codex-spark",
   "gpt-5.2-codex",
-  "o4-mini",
-  "o3",
 ];
 
 type PluginCfg = Record<string, unknown> | undefined;

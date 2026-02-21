@@ -217,7 +217,22 @@ export class CommandHandler {
   private async handleModel(arg: string, ctx: CommandContext): Promise<void> {
     if (!arg) {
       const current = this.getModelForConversation(ctx.conversationId) ?? "default";
-      this.reply(ctx, `目前模型: ${current}\n用法: /model <name>`);
+      const entry = this.store.getSession(ctx.conversationId);
+      const backendLabel = entry ? (entry.backend === "codex" ? "Codex" : "Claude") : "";
+
+      const models = this.store.listModels();
+      const lines = [
+        `目前模型: ${current}${backendLabel ? ` (${backendLabel})` : ""}`,
+        "",
+        "可用模型:",
+        ...models.map((m) => {
+          const active = m.id === current ? " ◀" : "";
+          return `  [${m.backend}] ${m.id}${active}`;
+        }),
+        "",
+        "用法: /model <name>",
+      ];
+      this.reply(ctx, lines.join("\n"));
       return;
     }
 
