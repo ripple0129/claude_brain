@@ -36,6 +36,7 @@ export interface SessionStoreConfig {
   geminiPath: string;
   geminiModels: Set<string>;
   mcpConfigPath?: string;
+  systemPrompt?: string;
   defaultCwd: string;
   maxSessions: number;
   idleTimeoutMs: number;
@@ -121,6 +122,7 @@ export class SessionStore {
         cwd,
         model,
         threadId: resumeId,
+        systemPrompt: this.config.systemPrompt,
         logger: this.logger,
       });
     } else if (backend === "gemini") {
@@ -129,12 +131,14 @@ export class SessionStore {
         cwd,
         model,
         sessionId: resumeId,
+        systemPrompt: this.config.systemPrompt,
         logger: this.logger,
       });
     } else {
       const processOpts: ClaudeProcessOptions = {
         claudePath: this.config.claudePath,
         mcpConfigPath: this.config.mcpConfigPath,
+        systemPrompt: this.config.systemPrompt,
         cwd,
         model,
         resumeSessionId: resumeId,

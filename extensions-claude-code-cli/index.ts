@@ -21,6 +21,11 @@ const DEFAULT_IDLE_TIMEOUT_MS = 600_000; // 10 minutes
 const CONTEXT_WINDOW = 200_000;
 const MAX_TOKENS = 16_384;
 
+const DEFAULT_SYSTEM_PROMPT = [
+  "When you create or save images/screenshots to local files, always include the full absolute file path in your response text.",
+  "The system will automatically detect local image paths and upload them for the user to view.",
+].join(" ");
+
 const DEFAULT_CODEX_MODELS = [
   "codex-mini-latest",
   "gpt-5.3-codex",
@@ -147,6 +152,12 @@ function resolveIdleTimeoutMs(api: OpenClawPluginApi): number {
   return DEFAULT_IDLE_TIMEOUT_MS;
 }
 
+function resolveSystemPrompt(api: OpenClawPluginApi): string | undefined {
+  const c = cfg(api);
+  if (c?.systemPrompt && typeof c.systemPrompt === "string") return c.systemPrompt;
+  return DEFAULT_SYSTEM_PROMPT;
+}
+
 /**
  * Read agents.defaults.model.primary from OpenClaw config.
  * If it's our provider (claude-code-cli/xxx), extract the model ID.
@@ -266,6 +277,7 @@ const plugin = {
         const geminiPath = resolveGeminiPath(api);
         const geminiModelList = resolveGeminiModels(api);
         const mcpConfigPath = resolveMcpConfigPath(api);
+        const systemPrompt = resolveSystemPrompt(api);
         const defaultCwd = resolveDefaultCwd(api);
         const defaultModel = resolveDefaultModel(api);
         const maxSessions = resolveMaxSessions(api);
@@ -284,6 +296,7 @@ const plugin = {
             geminiPath,
             geminiModels: new Set(geminiModelList),
             mcpConfigPath,
+            systemPrompt,
             defaultCwd,
             maxSessions,
             idleTimeoutMs,

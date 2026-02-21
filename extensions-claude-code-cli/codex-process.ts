@@ -12,6 +12,7 @@ export type CodexProcessOptions = {
   cwd?: string;
   model?: string;
   threadId?: string;
+  systemPrompt?: string;
   logger: Logger;
 };
 
@@ -306,7 +307,10 @@ export class CodexProcess {
     const args = ["exec", "--json", "--skip-git-repo-check", "--full-auto"];
     if (this.opts.cwd) args.push("--cd", this.opts.cwd);
     if (this.opts.model) args.push("--model", this.opts.model);
-    args.push(prompt);
+    const fullPrompt = this.opts.systemPrompt
+      ? `${this.opts.systemPrompt}\n\n${prompt}`
+      : prompt;
+    args.push(fullPrompt);
     return args;
   }
 

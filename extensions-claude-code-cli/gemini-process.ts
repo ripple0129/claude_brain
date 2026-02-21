@@ -12,6 +12,7 @@ export type GeminiProcessOptions = {
   cwd?: string;
   model?: string;
   sessionId?: string;
+  systemPrompt?: string;
   logger: Logger;
 };
 
@@ -293,7 +294,10 @@ export class GeminiProcess {
   }
 
   private buildExecArgs(prompt: string): string[] {
-    const args = ["-p", prompt, "--output-format", "stream-json", "--yolo"];
+    const fullPrompt = this.opts.systemPrompt
+      ? `${this.opts.systemPrompt}\n\n${prompt}`
+      : prompt;
+    const args = ["-p", fullPrompt, "--output-format", "stream-json", "--yolo"];
     if (this.opts.model) args.push("--model", this.opts.model);
     return args;
   }
