@@ -173,7 +173,11 @@ export function createBridgeServer(opts: BridgeOptions) {
       return;
     }
 
-    const model = typeof body.model === "string" ? body.model : "claude-code-cli";
+    let model = typeof body.model === "string" ? body.model : "claude-code-cli";
+    // OpenClaw may send "provider/model" format — strip the provider prefix
+    if (model.includes("/")) {
+      model = model.split("/").pop()!;
+    }
     const isStreaming = body.stream !== false;
     const latestUserMsg = extractLatestUserMsg(messages);
 
@@ -183,7 +187,7 @@ export function createBridgeServer(opts: BridgeOptions) {
     }
 
     logger.info(
-      `bridge: request — msgs=${messages.length} msg="${latestUserMsg.slice(0, 80)}${latestUserMsg.length > 80 ? "..." : ""}"`,
+      `bridge: request — model=${model} msgs=${messages.length} msg="${latestUserMsg.slice(0, 80)}${latestUserMsg.length > 80 ? "..." : ""}"`,
     );
 
     // Try command handling first (handles /new, /reset, etc.)

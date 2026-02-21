@@ -127,6 +127,24 @@ function resolveIdleTimeoutMs(api: OpenClawPluginApi): number {
   return DEFAULT_IDLE_TIMEOUT_MS;
 }
 
+/**
+ * Read agents.defaults.model.primary from OpenClaw config.
+ * If it's our provider (claude-code-cli/xxx), extract the model ID.
+ */
+function resolveDefaultModel(api: OpenClawPluginApi): string | undefined {
+  const agents = api.config?.agents as Record<string, unknown> | undefined;
+  const defaults = agents?.defaults as Record<string, unknown> | undefined;
+  const model = defaults?.model as Record<string, unknown> | undefined;
+  const primary = model?.primary as string | undefined;
+  if (!primary) return undefined;
+  // "claude-code-cli/gpt-5.3-codex" → "gpt-5.3-codex"
+  if (primary.includes("/")) {
+    const modelId = primary.split("/").pop()!;
+    return modelId !== "claude-code-cli" ? modelId : undefined;
+  }
+  return undefined;
+}
+
 const plugin = {
   id: "claude-code-cli",
   name: "Claude Code CLI",
@@ -227,8 +245,13 @@ const plugin = {
         const codexModelList = resolveCodexModels(api);
         const mcpConfigPath = resolveMcpConfigPath(api);
         const defaultCwd = resolveDefaultCwd(api);
+        const defaultModel = resolveDefaultModel(api);
         const maxSessions = resolveMaxSessions(api);
         const idleTimeoutMs = resolveIdleTimeoutMs(api);
+
+        if (defaultModel) {
+          ctx.logger.info(`bridge: default model from config: ${defaultModel}`);
+        }
 
         // Create shared SessionStore and CommandHandler
         sessionStore = new SessionStore(
@@ -244,7 +267,7 @@ const plugin = {
           ctx.logger,
           ctx.stateDir,
         );
-        const commandHandler = new CommandHandler(sessionStore, { defaultCwd });
+        const commandHandler = new CommandHandler(sessionStore, { defaultCwd, defaultModel });
 
         // Build model list for /v1/models endpoint
         const models = [

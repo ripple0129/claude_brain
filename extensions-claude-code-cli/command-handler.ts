@@ -14,6 +14,7 @@ export type CommandResult = { handled: true } | { handled: false };
 
 export interface CommandHandlerConfig {
   defaultCwd: string;
+  defaultModel?: string;
 }
 
 export class CommandHandler {
@@ -35,7 +36,7 @@ export class CommandHandler {
   }
 
   getModelForConversation(conversationId: string): string | undefined {
-    return this.modelOverrides.get(conversationId);
+    return this.modelOverrides.get(conversationId) ?? this.config.defaultModel;
   }
 
   async handle(content: string, ctx: CommandContext): Promise<CommandResult> {
