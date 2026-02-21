@@ -56,12 +56,24 @@ export function createArinovaAgentService(opts: ArinovaAgentServiceOptions) {
         entry = sessionStore.createSession(conversationId, { cwd, model });
       }
 
+      // Wire up cancel: abort the Claude turn when user cancels
+      const onAbort = () => {
+        logger.info(`arinova-agent: task cancelled for ${conversationId}`);
+        entry!.process.abortTurn();
+      };
+      task.signal.addEventListener("abort", onAbort, { once: true });
+
       let sendResult;
       try {
         sendResult = await entry.process.sendMessage(content, (text) => {
           task.sendChunk(text);
         });
       } catch (err) {
+        // If user cancelled, don't retry — just return
+        if (task.signal.aborted) {
+          logger.info(`arinova-agent: task aborted, skipping retry`);
+          return;
+        }
         // Process died or errored — try once more with a fresh process
         const errMsg = err instanceof Error ? err.message : String(err);
         logger.warn(`arinova-agent: sendMessage failed: ${errMsg}, restarting process...`);
@@ -69,10 +81,14 @@ export function createArinovaAgentService(opts: ArinovaAgentServiceOptions) {
         sendResult = await entry.process.sendMessage(content, (text) => {
           task.sendChunk(text);
         });
+      } finally {
+        task.signal.removeEventListener("abort", onAbort);
       }
 
       task.sendComplete(sendResult.text);
     } catch (err) {
+      // Don't report error if it was a cancellation
+      if (task.signal.aborted) return;
       const msg = err instanceof Error ? err.message : String(err);
       logger.error(`arinova-agent: task error for ${conversationId}: ${msg}`);
       task.sendError(msg);
