@@ -15,6 +15,15 @@
         "type": "string",
         "description": "Path to the claude CLI binary"
       },
+      "codexPath": {
+        "type": "string",
+        "description": "Path to the codex CLI binary (default: auto-detect)"
+      },
+      "codexModels": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Model IDs that route to the Codex CLI backend"
+      },
       "timeoutMs": {
         "type": "number",
         "description": "CLI timeout in milliseconds"

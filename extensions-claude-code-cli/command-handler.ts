@@ -116,6 +116,7 @@ export class CommandHandler {
     const cwd = this.getCwdForConversation(ctx.conversationId);
     const model = this.getModelForConversation(ctx.conversationId);
 
+    this.store.clearPersistedSession(ctx.conversationId);
     await this.store.destroySession(ctx.conversationId);
 
     this.reply(
@@ -137,7 +138,8 @@ export class CommandHandler {
       const status = s.alive ? "🟢" : "⚪";
       const id = s.sessionId.slice(0, 12);
       const model = s.model ?? "default";
-      lines.push(`${status} ${id}  ${model}  ${s.cwd}`);
+      const tag = s.backend === "codex" ? "[codex]" : "[claude]";
+      lines.push(`${status} ${id}  ${tag} ${model}  ${s.cwd}`);
     }
     lines.push("\n用法: /resume <session-id>");
     this.reply(ctx, lines.join("\n"));
@@ -151,7 +153,9 @@ export class CommandHandler {
       return;
     }
 
+    const backendLabel = entry.backend === "codex" ? "Codex CLI" : "Claude CLI";
     const lines = [
+      `Backend: ${backendLabel}`,
       `狀態: ${entry.process.isAlive() ? "連線中" : "已停止"}`,
       `工作目錄: ${entry.process.getCwd() ?? this.config.defaultCwd}`,
       `Session ID: ${entry.process.getSessionId().slice(0, 12) || "N/A"}`,
@@ -217,12 +221,22 @@ export class CommandHandler {
       return;
     }
 
+    // Check if backend type is changing
+    const currentEntry = this.store.getSession(ctx.conversationId);
+    const oldBackend = currentEntry?.backend;
+    const newBackend = this.store.resolveBackend(arg);
+
     this.modelOverrides.set(ctx.conversationId, arg);
 
-    const cwd = this.getCwdForConversation(ctx.conversationId);
+    // Clear persisted data if backend type changed
+    if (oldBackend && oldBackend !== newBackend) {
+      this.store.clearPersistedSession(ctx.conversationId);
+    }
+
     await this.store.destroySession(ctx.conversationId);
 
-    this.reply(ctx, `已切換模型為 ${arg}\n下次對話將使用新模型（上下文已重置）`);
+    const backendLabel = newBackend === "codex" ? "Codex" : "Claude";
+    this.reply(ctx, `已切換模型為 ${arg} (${backendLabel})\n下次對話將使用新模型（上下文已重置）`);
   }
 
   private async handleCompact(ctx: CommandContext): Promise<void> {

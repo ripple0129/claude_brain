@@ -9,11 +9,14 @@ type Logger = {
   error: (msg: string) => void;
 };
 
+type ModelInfo = { id: string; owned_by: string };
+
 type BridgeOptions = {
   port: number;
   sessionStore: SessionStore;
   commandHandler: CommandHandler;
   logger: Logger;
+  models?: ModelInfo[];
 };
 
 const DEBUG_CONVERSATION_ID = "debug";
@@ -138,9 +141,13 @@ function openAiError(message: string, type: string, code: string | null = null):
 }
 
 export function createBridgeServer(opts: BridgeOptions) {
-  const { port, sessionStore, commandHandler, logger } = opts;
+  const { port, sessionStore, commandHandler, logger, models } = opts;
   const mutex = createMutex();
   let server: Server | null = null;
+
+  const modelList: ModelInfo[] = models ?? [
+    { id: "claude-code-cli", owned_by: "anthropic" },
+  ];
 
   async function handleCompletions(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method !== "POST") {
@@ -207,12 +214,24 @@ export function createBridgeServer(opts: BridgeOptions) {
 
     try {
       const result = await mutex.run(async () => {
+        // Resolve the effective model: command override > request body
+        const cmdModel = commandHandler.getModelForConversation(DEBUG_CONVERSATION_ID);
+        const effectiveModel = cmdModel ?? (model !== "claude-code-cli" ? model : undefined);
+        const requestedBackend = sessionStore.resolveBackend(effectiveModel);
+
         // Ensure session exists for debug conversation
         let entry = sessionStore.getSession(DEBUG_CONVERSATION_ID);
+
+        // Backend mismatch → destroy and recreate
+        if (entry && entry.process.isAlive() && entry.backend !== requestedBackend) {
+          logger.info(`bridge: backend mismatch (${entry.backend} → ${requestedBackend}), recreating session`);
+          await sessionStore.destroySession(DEBUG_CONVERSATION_ID);
+          entry = undefined;
+        }
+
         if (!entry || !entry.process.isAlive()) {
           const cwd = commandHandler.getCwdForConversation(DEBUG_CONVERSATION_ID);
-          const sessionModel = commandHandler.getModelForConversation(DEBUG_CONVERSATION_ID);
-          entry = sessionStore.createSession(DEBUG_CONVERSATION_ID, { cwd, model: sessionModel });
+          entry = sessionStore.createSession(DEBUG_CONVERSATION_ID, { cwd, model: effectiveModel });
         } else {
           entry.lastActivity = Date.now();
         }
@@ -246,6 +265,17 @@ export function createBridgeServer(opts: BridgeOptions) {
         }
 
         if (keepAliveTimer) clearInterval(keepAliveTimer);
+
+        // Persist session ID for cross-restart resume
+        if (out.sessionId) {
+          sessionStore.persistSession(
+            DEBUG_CONVERSATION_ID,
+            out.sessionId,
+            entry.backend,
+            entry.model,
+            entry.cwd,
+          );
+        }
 
         // Upload any local image files (scan prose text)
         if (isStreaming && out) {
@@ -310,11 +340,11 @@ export function createBridgeServer(opts: BridgeOptions) {
       return;
     }
 
-    // Health check
-    if (url === "/v1/models" || url === "/v1/models/claude-code-cli") {
+    // Models endpoint
+    if (url === "/v1/models" || url.startsWith("/v1/models/")) {
       jsonResponse(res, 200, {
         object: "list",
-        data: [{ id: "claude-code-cli", object: "model", owned_by: "anthropic" }],
+        data: modelList.map((m) => ({ id: m.id, object: "model", owned_by: m.owned_by })),
       });
       return;
     }

@@ -13,12 +13,22 @@ import { createArinovaAgentService } from "./arinova-agent.js";
 
 const DEFAULT_PORT = 18810;
 const DEFAULT_CLAUDE_PATH = "claude";
+const DEFAULT_CODEX_PATH = "codex";
 const DEFAULT_CWD = path.join(homedir(), ".openclaw", "workspace");
 const DEFAULT_MAX_SESSIONS = 5;
 const DEFAULT_IDLE_TIMEOUT_MS = 600_000; // 10 minutes
 
 const CONTEXT_WINDOW = 200_000;
 const MAX_TOKENS = 16_384;
+
+const DEFAULT_CODEX_MODELS = [
+  "codex-mini-latest",
+  "gpt-5.3-codex",
+  "gpt-5.3-codex-spark",
+  "gpt-5.2-codex",
+  "o4-mini",
+  "o3",
+];
 
 type PluginCfg = Record<string, unknown> | undefined;
 function cfg(api: OpenClawPluginApi): PluginCfg {
@@ -40,6 +50,20 @@ function resolveClaudePath(api: OpenClawPluginApi): string {
   const c = cfg(api);
   if (c?.claudePath && typeof c.claudePath === "string") return c.claudePath;
   return process.env.CLAUDE_PATH ?? DEFAULT_CLAUDE_PATH;
+}
+
+function resolveCodexPath(api: OpenClawPluginApi): string {
+  const c = cfg(api);
+  if (c?.codexPath && typeof c.codexPath === "string") return c.codexPath;
+  return process.env.CODEX_PATH ?? DEFAULT_CODEX_PATH;
+}
+
+function resolveCodexModels(api: OpenClawPluginApi): string[] {
+  const c = cfg(api);
+  if (Array.isArray(c?.codexModels)) {
+    return (c.codexModels as unknown[]).filter((m): m is string => typeof m === "string");
+  }
+  return DEFAULT_CODEX_MODELS;
 }
 
 function resolveMcpConfigPath(api: OpenClawPluginApi): string | undefined {
@@ -201,6 +225,8 @@ const plugin = {
       start: async (ctx) => {
         const port = resolvePort(api);
         const claudePath = resolveClaudePath(api);
+        const codexPath = resolveCodexPath(api);
+        const codexModelList = resolveCodexModels(api);
         const mcpConfigPath = resolveMcpConfigPath(api);
         const defaultCwd = resolveDefaultCwd(api);
         const maxSessions = resolveMaxSessions(api);
@@ -208,10 +234,25 @@ const plugin = {
 
         // Create shared SessionStore and CommandHandler
         sessionStore = new SessionStore(
-          { claudePath, mcpConfigPath, defaultCwd, maxSessions, idleTimeoutMs },
+          {
+            claudePath,
+            codexPath,
+            codexModels: new Set(codexModelList),
+            mcpConfigPath,
+            defaultCwd,
+            maxSessions,
+            idleTimeoutMs,
+          },
           ctx.logger,
+          ctx.stateDir,
         );
         const commandHandler = new CommandHandler(sessionStore, { defaultCwd });
+
+        // Build model list for /v1/models endpoint
+        const models = [
+          { id: "claude-code-cli", owned_by: "anthropic" },
+          ...codexModelList.map((m) => ({ id: m, owned_by: "openai" })),
+        ];
 
         // Start HTTP bridge
         bridge = createBridgeServer({
@@ -219,6 +260,7 @@ const plugin = {
           sessionStore,
           commandHandler,
           logger: ctx.logger,
+          models,
         });
         await bridge.start();
 

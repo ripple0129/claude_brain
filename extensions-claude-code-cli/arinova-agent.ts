@@ -88,6 +88,17 @@ export function createArinovaAgentService(opts: ArinovaAgentServiceOptions) {
         task.signal.removeEventListener("abort", onAbort);
       }
 
+      // Persist session for cross-restart resume
+      if (sendResult.sessionId) {
+        sessionStore.persistSession(
+          conversationId,
+          sendResult.sessionId,
+          entry.backend,
+          entry.model,
+          entry.cwd,
+        );
+      }
+
       task.sendComplete(sendResult.text);
     } catch (err) {
       // Don't report error if it was a cancellation

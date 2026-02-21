@@ -1,4 +1,7 @@
 import { ClaudeProcess, type ClaudeProcessOptions } from "./claude-process.js";
+import { CodexProcess, type CodexProcessOptions } from "./codex-process.js";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import path from "node:path";
 
 type Logger = {
   info: (msg: string) => void;
@@ -6,8 +9,12 @@ type Logger = {
   error: (msg: string) => void;
 };
 
+export type CliProcess = ClaudeProcess | CodexProcess;
+export type Backend = "claude" | "codex";
+
 export interface SessionEntry {
-  process: ClaudeProcess;
+  process: CliProcess;
+  backend: Backend;
   lastActivity: number;
   cwd: string;
   model?: string;
@@ -23,28 +30,52 @@ export interface CreateSessionOpts {
 
 export interface SessionStoreConfig {
   claudePath: string;
+  codexPath: string;
+  codexModels: Set<string>;
   mcpConfigPath?: string;
   defaultCwd: string;
   maxSessions: number;
   idleTimeoutMs: number;
 }
 
+interface PersistedSession {
+  sessionId: string;
+  backend: Backend;
+  model: string;
+  cwd: string;
+  updatedAt: string;
+}
+
+const PERSIST_DEBOUNCE_MS = 500;
+
 /**
- * In-memory session store with idle eviction.
- * Manages per-conversationId ClaudeProcess instances.
+ * In-memory session store with idle eviction, model-based backend routing,
+ * and disk persistence for session/thread IDs.
  */
 export class SessionStore {
   private sessions = new Map<string, SessionEntry>();
   /** Preserved session IDs from destroyed sessions (for /resume). */
-  private deadSessionIds = new Map<string, { sessionId: string; cwd: string; model?: string }>();
+  private deadSessionIds = new Map<string, { sessionId: string; cwd: string; model?: string; backend: Backend }>();
   private config: SessionStoreConfig;
   private logger: Logger;
   private idleTimer: ReturnType<typeof setInterval> | null = null;
 
-  constructor(config: SessionStoreConfig, logger: Logger) {
+  // Persistence
+  private stateDir: string;
+  private persisted = new Map<string, PersistedSession>();
+  private saveTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(config: SessionStoreConfig, logger: Logger, stateDir?: string) {
     this.config = config;
     this.logger = logger;
+    this.stateDir = stateDir ?? "";
+    this.loadFromDisk();
     this.startIdleSweep();
+  }
+
+  resolveBackend(model?: string): Backend {
+    if (!model) return "claude";
+    return this.config.codexModels.has(model) ? "codex" : "claude";
   }
 
   createSession(conversationId: string, opts?: CreateSessionOpts): SessionEntry {
@@ -52,29 +83,51 @@ export class SessionStore {
 
     const cwd = opts?.cwd ?? this.config.defaultCwd;
     const model = opts?.model;
+    const backend = this.resolveBackend(model);
 
-    const processOpts: ClaudeProcessOptions = {
-      claudePath: this.config.claudePath,
-      mcpConfigPath: this.config.mcpConfigPath,
-      cwd,
-      model,
-      resumeSessionId: opts?.resumeSessionId,
-      compact: opts?.compact,
-      logger: this.logger,
-    };
+    // Check persisted data for auto-resume
+    let resumeId = opts?.resumeSessionId;
+    if (!resumeId) {
+      const saved = this.persisted.get(conversationId);
+      if (saved && saved.backend === backend && saved.sessionId) {
+        resumeId = saved.sessionId;
+        this.logger.info(`session-store: auto-resuming ${conversationId} from persisted ${resumeId.slice(0, 12)}`);
+      }
+    }
 
-    const proc = new ClaudeProcess(processOpts);
+    let proc: CliProcess;
+    if (backend === "codex") {
+      proc = new CodexProcess({
+        codexPath: this.config.codexPath,
+        cwd,
+        model,
+        threadId: resumeId,
+        logger: this.logger,
+      });
+    } else {
+      const processOpts: ClaudeProcessOptions = {
+        claudePath: this.config.claudePath,
+        mcpConfigPath: this.config.mcpConfigPath,
+        cwd,
+        model,
+        resumeSessionId: resumeId,
+        compact: opts?.compact,
+        logger: this.logger,
+      };
+      proc = new ClaudeProcess(processOpts);
+    }
     proc.start();
 
     const entry: SessionEntry = {
       process: proc,
+      backend,
       lastActivity: Date.now(),
       cwd,
       model,
     };
 
     this.sessions.set(conversationId, entry);
-    this.logger.info(`session-store: created session for ${conversationId} cwd=${cwd} model=${model ?? "default"}`);
+    this.logger.info(`session-store: created ${backend} session for ${conversationId} cwd=${cwd} model=${model ?? "default"}`);
     return entry;
   }
 
@@ -84,7 +137,7 @@ export class SessionStore {
 
     const sid = entry.process.getSessionId();
     if (sid) {
-      this.deadSessionIds.set(sid, { sessionId: sid, cwd: entry.cwd, model: entry.model });
+      this.deadSessionIds.set(sid, { sessionId: sid, cwd: entry.cwd, model: entry.model, backend: entry.backend });
     }
 
     await entry.process.stop();
@@ -104,7 +157,7 @@ export class SessionStore {
     return undefined;
   }
 
-  getDeadSession(sessionId: string): { sessionId: string; cwd: string; model?: string } | undefined {
+  getDeadSession(sessionId: string): { sessionId: string; cwd: string; model?: string; backend: Backend } | undefined {
     return this.deadSessionIds.get(sessionId);
   }
 
@@ -125,10 +178,30 @@ export class SessionStore {
     });
   }
 
+  /** Persist session data after a successful sendMessage. */
+  persistSession(conversationId: string, sessionId: string, backend: Backend, model: string | undefined, cwd: string): void {
+    this.persisted.set(conversationId, {
+      sessionId,
+      backend,
+      model: model ?? "",
+      cwd,
+      updatedAt: new Date().toISOString(),
+    });
+    this.scheduleSave();
+  }
+
+  /** Clear persisted data for a conversation (used by /new). */
+  clearPersistedSession(conversationId: string): void {
+    if (this.persisted.delete(conversationId)) {
+      this.scheduleSave();
+    }
+  }
+
   listSessions(): Array<{
     conversationId: string;
     sessionId: string;
     alive: boolean;
+    backend: Backend;
     cwd: string;
     model?: string;
     lastActivity: number;
@@ -138,6 +211,7 @@ export class SessionStore {
       conversationId: string;
       sessionId: string;
       alive: boolean;
+      backend: Backend;
       cwd: string;
       model?: string;
       lastActivity: number;
@@ -151,6 +225,7 @@ export class SessionStore {
           conversationId: convId,
           sessionId: sid,
           alive: entry.process.isAlive(),
+          backend: entry.backend,
           cwd: entry.cwd,
           model: entry.model,
           lastActivity: entry.lastActivity,
@@ -166,6 +241,7 @@ export class SessionStore {
           conversationId: "",
           sessionId: sid,
           alive: false,
+          backend: info.backend,
           cwd: info.cwd,
           model: info.model,
           lastActivity: 0,
@@ -176,6 +252,60 @@ export class SessionStore {
 
     return result;
   }
+
+  // --- Persistence ---
+
+  private get persistPath(): string {
+    return this.stateDir ? path.join(this.stateDir, "bridge-sessions.json") : "";
+  }
+
+  private loadFromDisk(): void {
+    const filePath = this.persistPath;
+    if (!filePath) return;
+
+    try {
+      if (!existsSync(filePath)) return;
+      const raw = readFileSync(filePath, "utf-8");
+      const data = JSON.parse(raw) as Record<string, PersistedSession>;
+      for (const [key, value] of Object.entries(data)) {
+        if (value.sessionId && value.backend) {
+          this.persisted.set(key, value);
+        }
+      }
+      this.logger.info(`session-store: loaded ${this.persisted.size} persisted session(s) from disk`);
+    } catch (err) {
+      this.logger.warn(`session-store: failed to load persisted sessions: ${err}`);
+    }
+  }
+
+  private saveToDisk(): void {
+    const filePath = this.persistPath;
+    if (!filePath) return;
+
+    try {
+      const dir = path.dirname(filePath);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+      const data: Record<string, PersistedSession> = {};
+      for (const [key, value] of this.persisted) {
+        data[key] = value;
+      }
+      writeFileSync(filePath, JSON.stringify(data, null, 2) + "\n", "utf-8");
+    } catch (err) {
+      this.logger.error(`session-store: failed to save persisted sessions: ${err}`);
+    }
+  }
+
+  private scheduleSave(): void {
+    if (this.saveTimer) return;
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null;
+      this.saveToDisk();
+    }, PERSIST_DEBOUNCE_MS);
+    this.saveTimer.unref();
+  }
+
+  // --- Eviction ---
 
   private enforceMaxSessions(): void {
     if (this.sessions.size < this.config.maxSessions) return;
@@ -195,7 +325,7 @@ export class SessionStore {
       const entry = this.sessions.get(oldestKey)!;
       const sid = entry.process.getSessionId();
       if (sid) {
-        this.deadSessionIds.set(sid, { sessionId: sid, cwd: entry.cwd, model: entry.model });
+        this.deadSessionIds.set(sid, { sessionId: sid, cwd: entry.cwd, model: entry.model, backend: entry.backend });
       }
       entry.process.stop().catch(() => {});
       this.sessions.delete(oldestKey);
@@ -210,7 +340,7 @@ export class SessionStore {
           this.logger.info(`session-store: idle timeout for ${key}`);
           const sid = entry.process.getSessionId();
           if (sid) {
-            this.deadSessionIds.set(sid, { sessionId: sid, cwd: entry.cwd, model: entry.model });
+            this.deadSessionIds.set(sid, { sessionId: sid, cwd: entry.cwd, model: entry.model, backend: entry.backend });
           }
           entry.process.stop().catch(() => {});
           this.sessions.delete(key);
@@ -221,6 +351,12 @@ export class SessionStore {
   }
 
   async stopAll(): Promise<void> {
+    // Flush pending saves
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+      this.saveToDisk();
+    }
     if (this.idleTimer) {
       clearInterval(this.idleTimer);
       this.idleTimer = null;
