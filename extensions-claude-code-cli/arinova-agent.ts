@@ -1,7 +1,4 @@
 import { ArinovaAgent } from "@arinova-ai/agent-sdk";
-import type { TaskContext } from "@arinova-ai/agent-sdk";
-import { readFile, access } from "node:fs/promises";
-import { resolve, isAbsolute, basename } from "node:path";
 import type { SessionStore } from "./session-store.js";
 import type { CommandHandler } from "./command-handler.js";
 
@@ -18,63 +15,6 @@ export type ArinovaAgentServiceOptions = {
   commandHandler: CommandHandler;
   logger: Logger;
 };
-
-const IMAGE_PATH_RE = /(?:(?:\/[\w.@~ -]+)+|(?:[\w.-]+\/)+[\w.-]+)\.(?:png|jpe?g|gif|webp)\b/gi;
-
-async function fileExists(p: string): Promise<boolean> {
-  try { await access(p); return true; } catch { return false; }
-}
-
-async function uploadWithRetry(
-  task: TaskContext,
-  data: Uint8Array,
-  fileName: string,
-  retries = 3,
-): Promise<{ url: string }> {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      return await task.uploadFile(data, fileName);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const isRetryable = msg.includes("503") || msg.includes("502") || msg.includes("429");
-      if (!isRetryable || attempt === retries) throw err;
-      await new Promise((r) => setTimeout(r, 1000 * attempt));
-    }
-  }
-  throw new Error("upload retries exhausted");
-}
-
-/**
- * Scan response text for local image paths, upload via task.uploadFile,
- * replace paths in text with markdown image links, and return modified text.
- */
-async function uploadResponseImages(
-  text: string,
-  workDir: string,
-  task: TaskContext,
-  logger: Logger,
-): Promise<string> {
-  const matches = text.match(IMAGE_PATH_RE);
-  if (!matches) return text;
-
-  let result = text;
-  const uniquePaths = [...new Set(matches)];
-  for (const rawPath of uniquePaths) {
-    const absPath = isAbsolute(rawPath) ? rawPath : resolve(workDir, rawPath);
-    if (!(await fileExists(absPath))) continue;
-
-    try {
-      const data = await readFile(absPath);
-      const fileName = basename(absPath);
-      const uploaded = await uploadWithRetry(task, new Uint8Array(data), fileName);
-      logger.info(`arinova-agent: uploaded image ${fileName} → ${uploaded.url}`);
-      result = result.split(rawPath).join(`![${fileName}](${uploaded.url})`);
-    } catch (err) {
-      logger.warn(`arinova-agent: image upload failed for ${absPath}: ${err}`);
-    }
-  }
-  return result;
-}
 
 /**
  * Creates and manages the Arinova Chat agent connection.
@@ -159,16 +99,7 @@ export function createArinovaAgentService(opts: ArinovaAgentServiceOptions) {
         );
       }
 
-      // Upload any local images found in the response and replace paths with URLs
-      let finalText = sendResult.text;
-      const workDir = entry.cwd || process.env.HOME + "/.openclaw/workspace";
-      try {
-        finalText = await uploadResponseImages(finalText, workDir, task, logger);
-      } catch (err) {
-        logger.warn(`arinova-agent: image upload scan failed: ${err}`);
-      }
-
-      task.sendComplete(finalText);
+      task.sendComplete(sendResult.text);
     } catch (err) {
       // Don't report error if it was a cancellation
       if (task.signal.aborted) return;
