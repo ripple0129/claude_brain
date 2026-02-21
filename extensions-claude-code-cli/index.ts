@@ -28,6 +28,12 @@ const DEFAULT_CODEX_MODELS = [
   "gpt-5.2-codex",
 ];
 
+const DEFAULT_GEMINI_MODELS = [
+  "gemini-3.1-pro-preview",
+  "gemini-3-pro-preview",
+  "gemini-3-flash-preview",
+];
+
 type PluginCfg = Record<string, unknown> | undefined;
 function cfg(api: OpenClawPluginApi): PluginCfg {
   return api.pluginConfig as PluginCfg;
@@ -62,6 +68,20 @@ function resolveCodexModels(api: OpenClawPluginApi): string[] {
     return (c.codexModels as unknown[]).filter((m): m is string => typeof m === "string");
   }
   return DEFAULT_CODEX_MODELS;
+}
+
+function resolveGeminiPath(api: OpenClawPluginApi): string {
+  const c = cfg(api);
+  if (c?.geminiPath && typeof c.geminiPath === "string") return c.geminiPath;
+  return process.env.GEMINI_PATH ?? "gemini";
+}
+
+function resolveGeminiModels(api: OpenClawPluginApi): string[] {
+  const c = cfg(api);
+  if (Array.isArray(c?.geminiModels)) {
+    return (c.geminiModels as unknown[]).filter((m): m is string => typeof m === "string");
+  }
+  return DEFAULT_GEMINI_MODELS;
 }
 
 function resolveMcpConfigPath(api: OpenClawPluginApi): string | undefined {
@@ -243,6 +263,8 @@ const plugin = {
         const claudePath = resolveClaudePath(api);
         const codexPath = resolveCodexPath(api);
         const codexModelList = resolveCodexModels(api);
+        const geminiPath = resolveGeminiPath(api);
+        const geminiModelList = resolveGeminiModels(api);
         const mcpConfigPath = resolveMcpConfigPath(api);
         const defaultCwd = resolveDefaultCwd(api);
         const defaultModel = resolveDefaultModel(api);
@@ -259,6 +281,8 @@ const plugin = {
             claudePath,
             codexPath,
             codexModels: new Set(codexModelList),
+            geminiPath,
+            geminiModels: new Set(geminiModelList),
             mcpConfigPath,
             defaultCwd,
             maxSessions,
@@ -273,6 +297,7 @@ const plugin = {
         const models = [
           { id: "claude-code-cli", owned_by: "anthropic" },
           ...codexModelList.map((m) => ({ id: m, owned_by: "openai" })),
+          ...geminiModelList.map((m) => ({ id: m, owned_by: "google" })),
         ];
 
         // Start HTTP bridge

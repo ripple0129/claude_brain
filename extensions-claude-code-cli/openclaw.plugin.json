@@ -24,6 +24,15 @@
         "items": { "type": "string" },
         "description": "Model IDs that route to the Codex CLI backend"
       },
+      "geminiPath": {
+        "type": "string",
+        "description": "Path to the gemini CLI binary (default: auto-detect)"
+      },
+      "geminiModels": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Model IDs that route to the Gemini CLI backend"
+      },
       "timeoutMs": {
         "type": "number",
         "description": "CLI timeout in milliseconds"

@@ -1,5 +1,6 @@
 import { ClaudeProcess, type ClaudeProcessOptions } from "./claude-process.js";
 import { CodexProcess, type CodexProcessOptions } from "./codex-process.js";
+import { GeminiProcess, type GeminiProcessOptions } from "./gemini-process.js";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 
@@ -9,8 +10,8 @@ type Logger = {
   error: (msg: string) => void;
 };
 
-export type CliProcess = ClaudeProcess | CodexProcess;
-export type Backend = "claude" | "codex";
+export type CliProcess = ClaudeProcess | CodexProcess | GeminiProcess;
+export type Backend = "claude" | "codex" | "gemini";
 
 export interface SessionEntry {
   process: CliProcess;
@@ -32,6 +33,8 @@ export interface SessionStoreConfig {
   claudePath: string;
   codexPath: string;
   codexModels: Set<string>;
+  geminiPath: string;
+  geminiModels: Set<string>;
   mcpConfigPath?: string;
   defaultCwd: string;
   maxSessions: number;
@@ -75,7 +78,9 @@ export class SessionStore {
 
   resolveBackend(model?: string): Backend {
     if (!model) return "claude";
-    return this.config.codexModels.has(model) ? "codex" : "claude";
+    if (this.config.codexModels.has(model)) return "codex";
+    if (this.config.geminiModels.has(model)) return "gemini";
+    return "claude";
   }
 
   /** List all available models with their backend type. */
@@ -85,6 +90,9 @@ export class SessionStore {
     ];
     for (const m of this.config.codexModels) {
       models.push({ id: m, backend: "codex" });
+    }
+    for (const m of this.config.geminiModels) {
+      models.push({ id: m, backend: "gemini" });
     }
     return models;
   }
@@ -113,6 +121,14 @@ export class SessionStore {
         cwd,
         model,
         threadId: resumeId,
+        logger: this.logger,
+      });
+    } else if (backend === "gemini") {
+      proc = new GeminiProcess({
+        geminiPath: this.config.geminiPath,
+        cwd,
+        model,
+        sessionId: resumeId,
         logger: this.logger,
       });
     } else {

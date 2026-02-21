@@ -139,7 +139,7 @@ export class CommandHandler {
       const status = s.alive ? "🟢" : "⚪";
       const id = s.sessionId.slice(0, 12);
       const model = s.model ?? "default";
-      const tag = s.backend === "codex" ? "[codex]" : "[claude]";
+      const tag = s.backend === "codex" ? "[codex]" : s.backend === "gemini" ? "[gemini]" : "[claude]";
       lines.push(`${status} ${id}  ${tag} ${model}  ${s.cwd}`);
     }
     lines.push("\n用法: /resume <session-id>");
@@ -154,7 +154,7 @@ export class CommandHandler {
       return;
     }
 
-    const backendLabel = entry.backend === "codex" ? "Codex CLI" : "Claude CLI";
+    const backendLabel = entry.backend === "codex" ? "Codex CLI" : entry.backend === "gemini" ? "Gemini CLI" : "Claude CLI";
     const lines = [
       `Backend: ${backendLabel}`,
       `狀態: ${entry.process.isAlive() ? "連線中" : "已停止"}`,
@@ -219,7 +219,7 @@ export class CommandHandler {
     if (!arg) {
       const current = this.getModelForConversation(ctx.conversationId) ?? "default";
       const entry = this.store.getSession(ctx.conversationId);
-      const backendLabel = entry ? (entry.backend === "codex" ? "Codex" : "Claude") : "";
+      const backendLabel = entry ? (entry.backend === "codex" ? "Codex" : entry.backend === "gemini" ? "Gemini" : "Claude") : "";
 
       const models = this.store.listModels();
       const lines = [
@@ -251,7 +251,7 @@ export class CommandHandler {
 
     await this.store.destroySession(ctx.conversationId);
 
-    const backendLabel = newBackend === "codex" ? "Codex" : "Claude";
+    const backendLabel = newBackend === "codex" ? "Codex" : newBackend === "gemini" ? "Gemini" : "Claude";
     this.reply(ctx, `已切換模型為 ${arg} (${backendLabel})\n下次對話將使用新模型（上下文已重置）`);
   }
 
