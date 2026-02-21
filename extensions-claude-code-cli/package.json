@@ -5,7 +5,7 @@
   "description": "OpenClaw Claude Code CLI bridge provider plugin",
   "type": "module",
   "dependencies": {
-    "@arinova-ai/agent-sdk": "^0.0.4"
+    "@arinova-ai/agent-sdk": "^0.0.5"
   },
   "peerDependencies": {
     "openclaw": ">=2026"

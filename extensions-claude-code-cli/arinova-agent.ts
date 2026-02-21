@@ -1,4 +1,7 @@
 import { ArinovaAgent } from "@arinova-ai/agent-sdk";
+import type { TaskContext } from "@arinova-ai/agent-sdk";
+import { readFile, access } from "node:fs/promises";
+import { resolve, isAbsolute, basename } from "node:path";
 import type { SessionStore } from "./session-store.js";
 import type { CommandHandler } from "./command-handler.js";
 
@@ -15,6 +18,42 @@ export type ArinovaAgentServiceOptions = {
   commandHandler: CommandHandler;
   logger: Logger;
 };
+
+const IMAGE_PATH_RE = /(?:(?:\/[\w.@~ -]+)+|(?:[\w.-]+\/)+[\w.-]+)\.(?:png|jpe?g|gif|webp)\b/gi;
+
+async function fileExists(p: string): Promise<boolean> {
+  try { await access(p); return true; } catch { return false; }
+}
+
+/**
+ * Scan response text for local image paths, upload via task.uploadFile,
+ * and send markdown image links as chunks.
+ */
+async function uploadResponseImages(
+  text: string,
+  workDir: string,
+  task: TaskContext,
+  logger: Logger,
+): Promise<void> {
+  const matches = text.match(IMAGE_PATH_RE);
+  if (!matches) return;
+
+  const uniquePaths = [...new Set(matches)];
+  for (const rawPath of uniquePaths) {
+    const absPath = isAbsolute(rawPath) ? rawPath : resolve(workDir, rawPath);
+    if (!(await fileExists(absPath))) continue;
+
+    try {
+      const data = await readFile(absPath);
+      const fileName = basename(absPath);
+      const result = await task.uploadFile(new Uint8Array(data), fileName);
+      logger.info(`arinova-agent: uploaded image ${fileName} → ${result.url}`);
+      task.sendChunk(`\n\n![${fileName}](${result.url})`);
+    } catch (err) {
+      logger.warn(`arinova-agent: image upload failed for ${absPath}: ${err}`);
+    }
+  }
+}
 
 /**
  * Creates and manages the Arinova Chat agent connection.
@@ -97,6 +136,14 @@ export function createArinovaAgentService(opts: ArinovaAgentServiceOptions) {
           entry.model,
           entry.cwd,
         );
+      }
+
+      // Upload any local images found in the response
+      const workDir = entry.cwd || process.env.HOME + "/.openclaw/workspace";
+      try {
+        await uploadResponseImages(sendResult.text, workDir, task, logger);
+      } catch (err) {
+        logger.warn(`arinova-agent: image upload scan failed: ${err}`);
       }
 
       task.sendComplete(sendResult.text);
