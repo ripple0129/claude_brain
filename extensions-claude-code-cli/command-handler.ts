@@ -33,9 +33,10 @@ export class CommandHandler {
   }
 
   getCwdForConversation(conversationId: string): string {
-    return this.cwdOverrides.get(conversationId)
-      ?? this.config.agentCwdDefaults?.[conversationId]
-      ?? this.config.defaultCwd;
+    if (this.cwdOverrides.has(conversationId)) return this.cwdOverrides.get(conversationId)!;
+    if (this.config.agentCwdDefaults?.[conversationId]) return this.config.agentCwdDefaults[conversationId];
+    if (conversationId !== "default") return `${this.config.defaultCwd}-${conversationId}`;
+    return this.config.defaultCwd;
   }
 
   getModelForConversation(conversationId: string): string | undefined {
