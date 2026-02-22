@@ -274,8 +274,12 @@ export function createBridgeServer(opts: BridgeOptions) {
           out = await entry.process.sendMessage(latestUserMsg, onText);
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
-          logger.warn(`bridge: sendMessage failed: ${errMsg}, restarting process...`);
-          await entry.process.restart();
+          logger.warn(`bridge: sendMessage failed: ${errMsg}, recreating session...`);
+          // Stale persisted session → clear and start fresh
+          sessionStore.clearPersistedSession(agent);
+          await sessionStore.destroySession(agent);
+          const cwd = commandHandler.getCwdForConversation(agent);
+          entry = sessionStore.createSession(agent, { cwd, model: effectiveModel });
           out = await entry.process.sendMessage(latestUserMsg, onText);
         }
 
