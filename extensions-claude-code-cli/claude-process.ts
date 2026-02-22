@@ -24,7 +24,7 @@ export type SendMessageResult = {
 };
 
 const DEFAULT_CLAUDE_PATH = "claude";
-const TURN_TIMEOUT_MS = 10 * 60 * 1000;
+const TURN_TIMEOUT_MS = 60 * 60 * 1000;
 
 /**
  * Persistent Claude Code CLI process using the bidirectional stream-json protocol.
