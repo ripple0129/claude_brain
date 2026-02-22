@@ -140,9 +140,9 @@ export class ClaudeProcess {
       }
     });
 
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
       const stderrTail = this.stderrBuf.join("\n");
-      log.warn(`claude-process: process exited code=${code}`);
+      log.warn(`claude-process: process exited code=${code} signal=${signal}`);
       if (stderrTail) {
         log.error(`claude-process: stderr output:\n${stderrTail}`);
       }
