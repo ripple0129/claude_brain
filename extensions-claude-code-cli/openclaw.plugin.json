@@ -1,7 +1,7 @@
 {
   "id": "claude-code-cli",
   "name": "Claude Code CLI",
-  "description": "Bridge provider that routes requests to the Claude Code CLI via HTTP bridge and Arinova Chat agent.",
+  "description": "Bridge provider that routes requests to the Claude Code CLI via HTTP bridge.",
   "providers": ["claude-code-cli"],
   "configSchema": {
     "type": "object",
@@ -40,20 +40,6 @@
       "mcpConfigPath": {
         "type": "string",
         "description": "Path to MCP servers JSON config file (passed to claude --mcp-config)"
-      },
-      "arinova": {
-        "type": "object",
-        "description": "Arinova Chat agent connection settings",
-        "properties": {
-          "serverUrl": {
-            "type": "string",
-            "description": "WebSocket server URL (e.g. wss://api.chat.arinova.ai)"
-          },
-          "botToken": {
-            "type": "string",
-            "description": "Bot token from the Arinova dashboard"
-          }
-        }
       },
       "defaults": {
         "type": "object",

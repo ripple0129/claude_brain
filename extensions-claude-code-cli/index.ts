@@ -9,7 +9,6 @@ import path from "node:path";
 import { createBridgeServer } from "./bridge-server.js";
 import { SessionStore } from "./session-store.js";
 import { CommandHandler } from "./command-handler.js";
-import { createArinovaAgentService } from "./arinova-agent.js";
 
 const DEFAULT_PORT = 18810;
 const DEFAULT_CLAUDE_PATH = "claude";
@@ -95,28 +94,6 @@ function resolveMcpConfigPath(api: OpenClawPluginApi): string | undefined {
   return process.env.OPENCLAW_CLAUDE_MCP_CONFIG ?? undefined;
 }
 
-function arinovaChannelConfig(api: OpenClawPluginApi): Record<string, unknown> | undefined {
-  return api.config?.channels?.["openclaw-arinova-ai"] as Record<string, unknown> | undefined;
-}
-
-function resolveArinovaServerUrl(api: OpenClawPluginApi): string {
-  const c = cfg(api);
-  const arinova = c?.arinova as Record<string, unknown> | undefined;
-  if (arinova?.serverUrl && typeof arinova.serverUrl === "string") return arinova.serverUrl;
-  const ch = arinovaChannelConfig(api);
-  if (ch?.apiUrl && typeof ch.apiUrl === "string") return ch.apiUrl;
-  return process.env.ARINOVA_SERVER_URL ?? "wss://api.chat.arinova.ai";
-}
-
-function resolveArinovaBotToken(api: OpenClawPluginApi): string {
-  const c = cfg(api);
-  const arinova = c?.arinova as Record<string, unknown> | undefined;
-  if (arinova?.botToken && typeof arinova.botToken === "string") return arinova.botToken;
-  const ch = arinovaChannelConfig(api);
-  if (ch?.botToken && typeof ch.botToken === "string") return ch.botToken;
-  return process.env.ARINOVA_BOT_TOKEN ?? "";
-}
-
 function resolveDefaultCwd(api: OpenClawPluginApi): string {
   const c = cfg(api);
   const defaults = c?.defaults as Record<string, unknown> | undefined;
@@ -183,7 +160,6 @@ const plugin = {
 
   register(api: OpenClawPluginApi) {
     let bridge: ReturnType<typeof createBridgeServer> | null = null;
-    let arinovaAgent: ReturnType<typeof createArinovaAgentService> | null = null;
     let sessionStore: SessionStore | null = null;
 
     // --- Provider registration ---
@@ -322,34 +298,8 @@ const plugin = {
           models,
         });
         await bridge.start();
-
-        // Start Arinova agent (optional — skip if no bot token)
-        const botToken = resolveArinovaBotToken(api);
-        if (botToken) {
-          const serverUrl = resolveArinovaServerUrl(api);
-          arinovaAgent = createArinovaAgentService({
-            serverUrl,
-            botToken,
-            sessionStore,
-            commandHandler,
-            logger: ctx.logger,
-          });
-          try {
-            await arinovaAgent.start();
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            ctx.logger.error(`arinova-agent: failed to connect: ${msg}`);
-            arinovaAgent = null;
-          }
-        } else {
-          ctx.logger.info("arinova-agent: no bot token configured, skipping");
-        }
       },
       stop: async () => {
-        if (arinovaAgent) {
-          arinovaAgent.stop();
-          arinovaAgent = null;
-        }
         if (bridge) {
           await bridge.stop();
           bridge = null;

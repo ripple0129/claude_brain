@@ -80,7 +80,7 @@ export class CommandHandler {
     }
   }
 
-  /** Get the list of skills to register with Arinova. */
+  /** Get the list of available slash-command skills. */
   getSkills(): Array<{ id: string; name: string; description: string }> {
     return [
       { id: "new", name: "New", description: "開新工作階段 (可帶路徑: /new ~/project)" },
