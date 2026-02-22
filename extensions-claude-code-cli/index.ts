@@ -274,6 +274,7 @@ const plugin = {
         const maxSessions = resolveMaxSessions(api);
         const idleTimeoutMs = resolveIdleTimeoutMs(api);
 
+        ctx.logger.info(`bridge: idleTimeoutMs=${idleTimeoutMs} maxSessions=${maxSessions} defaultCwd=${defaultCwd}`);
         if (defaultModel) {
           ctx.logger.info(`bridge: default model from config: ${defaultModel}`);
         }
