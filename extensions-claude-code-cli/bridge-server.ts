@@ -19,8 +19,6 @@ type BridgeOptions = {
   models?: ModelInfo[];
 };
 
-const DEBUG_CONVERSATION_ID = "debug";
-
 type ContentBlock = { type: string; text?: string };
 type MessageContent = string | ContentBlock[];
 
@@ -28,6 +26,14 @@ type ChatMessage = {
   role: string;
   content: MessageContent;
 };
+
+function parseModelId(raw: string): { agent: string; model: string } {
+  const match = raw.match(/^(.+?)\(([^)]+)\)$/);
+  if (match) {
+    return { agent: match[2].toLowerCase(), model: match[1] };
+  }
+  return { agent: "default", model: raw };
+}
 
 function contentToString(content: MessageContent): string {
   if (typeof content === "string") return content;
@@ -178,6 +184,11 @@ export function createBridgeServer(opts: BridgeOptions) {
     if (model.includes("/")) {
       model = model.split("/").pop()!;
     }
+    // Parse agent name from model ID: "model(agent)" → agent, model
+    const parsed = parseModelId(model);
+    const agent = parsed.agent;
+    model = parsed.model;
+
     const isStreaming = body.stream !== false;
     const latestUserMsg = extractLatestUserMsg(messages);
 
@@ -187,14 +198,14 @@ export function createBridgeServer(opts: BridgeOptions) {
     }
 
     logger.info(
-      `bridge: request — model=${model} msgs=${messages.length} msg="${latestUserMsg.slice(0, 80)}${latestUserMsg.length > 80 ? "..." : ""}"`,
+      `bridge: request — agent=${agent} model=${model} msgs=${messages.length} msg="${latestUserMsg.slice(0, 80)}${latestUserMsg.length > 80 ? "..." : ""}"`,
     );
 
     // Try command handling first (handles /new, /reset, etc.)
     if (latestUserMsg.trim().startsWith("/")) {
       let cmdReply = "";
       const cmdResult = await commandHandler.handle(latestUserMsg, {
-        conversationId: DEBUG_CONVERSATION_ID,
+        conversationId: agent,
         sendChunk: (text) => { cmdReply = text; },
         sendComplete: (text) => { cmdReply = text; },
         sendError: (text) => { cmdReply = `Error: ${text}`; },
@@ -219,23 +230,23 @@ export function createBridgeServer(opts: BridgeOptions) {
     try {
       const result = await mutex.run(async () => {
         // Resolve the effective model: command override > request body
-        const cmdModel = commandHandler.getModelForConversation(DEBUG_CONVERSATION_ID);
+        const cmdModel = commandHandler.getModelForConversation(agent);
         const effectiveModel = cmdModel ?? (model !== "claude-code-cli" ? model : undefined);
         const requestedBackend = sessionStore.resolveBackend(effectiveModel);
 
-        // Ensure session exists for debug conversation
-        let entry = sessionStore.getSession(DEBUG_CONVERSATION_ID);
+        // Ensure session exists for this agent
+        let entry = sessionStore.getSession(agent);
 
         // Backend mismatch → destroy and recreate
         if (entry && entry.process.isAlive() && entry.backend !== requestedBackend) {
           logger.info(`bridge: backend mismatch (${entry.backend} → ${requestedBackend}), recreating session`);
-          await sessionStore.destroySession(DEBUG_CONVERSATION_ID);
+          await sessionStore.destroySession(agent);
           entry = undefined;
         }
 
         if (!entry || !entry.process.isAlive()) {
-          const cwd = commandHandler.getCwdForConversation(DEBUG_CONVERSATION_ID);
-          entry = sessionStore.createSession(DEBUG_CONVERSATION_ID, { cwd, model: effectiveModel });
+          const cwd = commandHandler.getCwdForConversation(agent);
+          entry = sessionStore.createSession(agent, { cwd, model: effectiveModel });
         } else {
           entry.lastActivity = Date.now();
         }
@@ -273,7 +284,7 @@ export function createBridgeServer(opts: BridgeOptions) {
         // Persist session ID for cross-restart resume
         if (out.sessionId) {
           sessionStore.persistSession(
-            DEBUG_CONVERSATION_ID,
+            agent,
             out.sessionId,
             entry.backend,
             entry.model,

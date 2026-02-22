@@ -58,6 +58,19 @@
             "description": "Idle session timeout in milliseconds (default: 600000)"
           }
         }
+      },
+      "agents": {
+        "type": "object",
+        "description": "Per-agent workspace overrides (key = agent name)",
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "cwd": {
+              "type": "string",
+              "description": "Working directory for this agent"
+            }
+          }
+        }
       }
     }
   }

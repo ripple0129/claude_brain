@@ -135,6 +135,21 @@ function resolveSystemPrompt(api: OpenClawPluginApi): string | undefined {
   return DEFAULT_SYSTEM_PROMPT;
 }
 
+function resolveAgentCwdDefaults(api: OpenClawPluginApi): Record<string, string> | undefined {
+  const c = cfg(api);
+  const agents = c?.agents as Record<string, unknown> | undefined;
+  if (!agents || typeof agents !== "object") return undefined;
+
+  const result: Record<string, string> = {};
+  for (const [name, value] of Object.entries(agents)) {
+    const agentCfg = value as Record<string, unknown> | undefined;
+    if (agentCfg?.cwd && typeof agentCfg.cwd === "string") {
+      result[name.toLowerCase()] = agentCfg.cwd.replace(/^~/, homedir());
+    }
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
 /**
  * Read agents.defaults.model.primary from OpenClaw config.
  * If it's our provider (claude-code-cli/xxx), extract the model ID.
@@ -280,7 +295,8 @@ const plugin = {
           ctx.logger,
           ctx.stateDir,
         );
-        const commandHandler = new CommandHandler(sessionStore, { defaultCwd, defaultModel });
+        const agentCwdDefaults = resolveAgentCwdDefaults(api);
+        const commandHandler = new CommandHandler(sessionStore, { defaultCwd, defaultModel, agentCwdDefaults });
 
         // Build model list for /v1/models endpoint
         const models = [

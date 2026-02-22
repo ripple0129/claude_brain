@@ -15,6 +15,7 @@ export type CommandResult = { handled: true } | { handled: false };
 export interface CommandHandlerConfig {
   defaultCwd: string;
   defaultModel?: string;
+  agentCwdDefaults?: Record<string, string>;
 }
 
 export class CommandHandler {
@@ -32,7 +33,9 @@ export class CommandHandler {
   }
 
   getCwdForConversation(conversationId: string): string {
-    return this.cwdOverrides.get(conversationId) ?? this.config.defaultCwd;
+    return this.cwdOverrides.get(conversationId)
+      ?? this.config.agentCwdDefaults?.[conversationId]
+      ?? this.config.defaultCwd;
   }
 
   getModelForConversation(conversationId: string): string | undefined {
