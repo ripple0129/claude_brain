@@ -1,6 +1,7 @@
 import { ArinovaAgent } from "@arinova-ai/agent-sdk";
-import { readFile, access } from "node:fs/promises";
-import { resolve, isAbsolute, basename } from "node:path";
+import type { TaskAttachment } from "@arinova-ai/agent-sdk";
+import { readFile, writeFile, access, mkdir } from "node:fs/promises";
+import { resolve, isAbsolute, basename, join } from "node:path";
 import type { SessionStore } from "./session-store.js";
 import type { CommandHandler } from "./command-handler.js";
 
@@ -22,6 +23,38 @@ const IMAGE_PATH_RE = /(?:(?:\/[\w.@~ -]+)+|(?:[\w.-]+\/)+[\w.-]+)\.(?:png|jpe?g
 
 async function fileExists(p: string): Promise<boolean> {
   try { await access(p); return true; } catch { return false; }
+}
+
+/**
+ * Download user attachments to the workspace directory.
+ * Returns local file paths for each successfully downloaded attachment.
+ */
+async function downloadAttachments(
+  attachments: TaskAttachment[],
+  workDir: string,
+  logger: Logger,
+): Promise<string[]> {
+  const downloadDir = join(workDir, "attachments");
+  await mkdir(downloadDir, { recursive: true });
+
+  const paths: string[] = [];
+  for (const att of attachments) {
+    try {
+      const res = await fetch(att.url);
+      if (!res.ok) {
+        logger.warn(`arinova-agent: download failed for ${att.fileName}: ${res.status}`);
+        continue;
+      }
+      const data = new Uint8Array(await res.arrayBuffer());
+      const localPath = join(downloadDir, att.fileName);
+      await writeFile(localPath, data);
+      logger.info(`arinova-agent: downloaded ${att.fileName} → ${localPath}`);
+      paths.push(localPath);
+    } catch (err) {
+      logger.warn(`arinova-agent: download failed for ${att.fileName}: ${err}`);
+    }
+  }
+  return paths;
 }
 
 /**
@@ -110,9 +143,20 @@ export function createArinovaAgentService(opts: ArinovaAgentServiceOptions) {
       };
       task.signal.addEventListener("abort", onAbort, { once: true });
 
+      // Download user attachments to workspace
+      let prompt = content;
+      if (task.attachments?.length) {
+        const workDir = entry.cwd || process.env.HOME + "/.openclaw/workspace";
+        const localPaths = await downloadAttachments(task.attachments, workDir, logger);
+        if (localPaths.length) {
+          const fileList = localPaths.map((p) => `- ${p}`).join("\n");
+          prompt = `${content}\n\n[Attached files]\n${fileList}`;
+        }
+      }
+
       let sendResult;
       try {
-        sendResult = await entry.process.sendMessage(content, (text) => {
+        sendResult = await entry.process.sendMessage(prompt, (text) => {
           task.sendChunk(text);
         });
       } catch (err) {
@@ -125,7 +169,7 @@ export function createArinovaAgentService(opts: ArinovaAgentServiceOptions) {
         const errMsg = err instanceof Error ? err.message : String(err);
         logger.warn(`arinova-agent: sendMessage failed: ${errMsg}, restarting process...`);
         await entry.process.restart();
-        sendResult = await entry.process.sendMessage(content, (text) => {
+        sendResult = await entry.process.sendMessage(prompt, (text) => {
           task.sendChunk(text);
         });
       } finally {
