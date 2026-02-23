@@ -16,6 +16,7 @@ export type ClaudeProcessOptions = {
   compact?: boolean;
   env?: Record<string, string>;
   logger: Logger;
+  label?: string;
 };
 
 export type SendMessageResult = {
@@ -48,8 +49,11 @@ export class ClaudeProcess {
   private turnOnText: ((text: string) => void) | null = null;
   private turnTimeout: ReturnType<typeof setTimeout> | null = null;
 
+  private tag: string;
+
   constructor(opts: ClaudeProcessOptions) {
     this.opts = opts;
+    this.tag = opts.label ? `claude[${opts.label}]` : "claude-process";
   }
 
   start(): void {
@@ -96,7 +100,7 @@ export class ClaudeProcess {
       env.PATH = env.PATH.split(":").filter((p) => !p.includes("node_modules/.bin")).join(":");
     }
 
-    log.info(`claude-process: spawning args=${argv.filter(a => a !== "").join(" ")}`);
+    log.info(`${this.tag}: spawning args=${argv.filter(a => a !== "").join(" ")}`);
 
     const child = spawn(claudePath, argv, {
       env,
@@ -121,7 +125,7 @@ export class ClaudeProcess {
       const text = chunk.toString();
       for (const line of text.split("\n")) {
         if (line.trim()) {
-          log.warn(`claude-process: [stderr] ${line.trim()}`);
+          log.warn(`${this.tag}: [stderr] ${line.trim()}`);
           this.stderrBuf.push(line.trim());
           if (this.stderrBuf.length > 20) this.stderrBuf.shift();
         }
@@ -129,7 +133,7 @@ export class ClaudeProcess {
     });
 
     child.on("error", (err: NodeJS.ErrnoException) => {
-      log.error(`claude-process: spawn error: ${err.message}`);
+      log.error(`${this.tag}: spawn error: ${err.message}`);
       this.alive = false;
       this.child = null;
       this.clearTurnTimeout();
@@ -142,9 +146,9 @@ export class ClaudeProcess {
 
     child.on("close", (code, signal) => {
       const stderrTail = this.stderrBuf.join("\n");
-      log.warn(`claude-process: process exited code=${code} signal=${signal}`);
+      log.warn(`${this.tag}: process exited code=${code} signal=${signal}`);
       if (stderrTail) {
-        log.error(`claude-process: stderr output:\n${stderrTail}`);
+        log.error(`${this.tag}: stderr output:\n${stderrTail}`);
       }
       this.alive = false;
       this.child = null;
@@ -181,7 +185,7 @@ export class ClaudeProcess {
 
       this.turnTimeout = setTimeout(() => {
         log.error(
-          `claude-process: turn timeout after ${TURN_TIMEOUT_MS / 1000}s ` +
+          `${this.tag}: turn timeout after ${TURN_TIMEOUT_MS / 1000}s ` +
           `proseLen=${this.turnProseText.length}`,
         );
         this.completeTurn();
@@ -192,11 +196,11 @@ export class ClaudeProcess {
         message: { role: "user", content: text },
       });
 
-      log.info(`claude-process: sending message (${text.length} chars)`);
+      log.info(`${this.tag}: sending message (${text.length} chars)`);
 
       this.child!.stdin!.write(msg + "\n", (err) => {
         if (err) {
-          log.error(`claude-process: stdin write error: ${err.message}`);
+          log.error(`${this.tag}: stdin write error: ${err.message}`);
           this.clearTurnTimeout();
           this.turnResolve = null;
           this.turnReject = null;
@@ -251,7 +255,7 @@ export class ClaudeProcess {
     try {
       event = JSON.parse(line) as Record<string, unknown>;
     } catch {
-      log.warn(`claude-process: unparseable line: ${line.slice(0, 200)}`);
+      log.warn(`${this.tag}: unparseable line: ${line.slice(0, 200)}`);
       return;
     }
 
@@ -260,7 +264,7 @@ export class ClaudeProcess {
     if (eventType === "system" && event.subtype === "init") {
       if (typeof event.session_id === "string") {
         this.sessionId = event.session_id as string;
-        log.info(`claude-process: session init sid=${this.sessionId.slice(0, 12)}`);
+        log.info(`${this.tag}: session init sid=${this.sessionId.slice(0, 12)}`);
       }
       return;
     }
@@ -269,7 +273,7 @@ export class ClaudeProcess {
       const info = event.rate_limit_info as Record<string, unknown> | undefined;
       const status = String(info?.status ?? "unknown");
       if (status !== "allowed") {
-        log.warn(`claude-process: rate limit status=${status} info=${JSON.stringify(info)}`);
+        log.warn(`${this.tag}: rate limit status=${status} info=${JSON.stringify(info)}`);
       }
       return;
     }
@@ -312,10 +316,10 @@ export class ClaudeProcess {
       if (event.is_error || event.subtype === "error_during_execution") {
         const errors = event.errors as string[] | undefined;
         const errorMsg = errors?.join("; ") ?? String(event.result ?? "unknown error");
-        log.error(`claude-process: turn error: ${errorMsg}`);
+        log.error(`${this.tag}: turn error: ${errorMsg}`);
 
         if (!this.turnProseText.trim()) {
-          log.warn("claude-process: error with no prose output, rejecting");
+          log.warn(`${this.tag}: error with no prose output, rejecting`);
           this.clearTurnTimeout();
           if (this.turnReject) {
             const reject = this.turnReject;
@@ -329,7 +333,7 @@ export class ClaudeProcess {
       }
 
       log.info(
-        `claude-process: turn complete sid=${this.sessionId.slice(0, 12)} ` +
+        `${this.tag}: turn complete sid=${this.sessionId.slice(0, 12)} ` +
         `proseLen=${this.turnProseText.length} ` +
         `turns=${numTurns} cost=$${costUsd} dur=${durationMs}ms`,
       );
@@ -338,11 +342,11 @@ export class ClaudeProcess {
       return;
     }
 
-    log.warn(`claude-process: unhandled event type="${eventType}" subtype="${event.subtype ?? ""}"`);
+    log.warn(`${this.tag}: unhandled event type="${eventType}" subtype="${event.subtype ?? ""}"`);
   }
 
   async restart(): Promise<void> {
-    this.opts.logger.info("claude-process: restarting...");
+    this.opts.logger.info(`${this.tag}: restarting...`);
     await this.stop();
     this.start();
   }

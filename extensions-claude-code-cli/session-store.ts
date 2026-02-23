@@ -144,6 +144,7 @@ export class SessionStore {
         resumeSessionId: resumeId,
         compact: opts?.compact,
         logger: this.logger,
+        label: conversationId,
       };
       proc = new ClaudeProcess(processOpts);
     }
