@@ -48,12 +48,18 @@ function contentToString(content: MessageContent): string {
 
 // Simple mutex for sequential request processing
 function createMutex() {
-  let pending: Promise<void> = Promise.resolve();
+  let locked = false;
   return {
-    run<T>(fn: () => Promise<T>): Promise<T> {
-      const next = pending.then(() => fn());
-      pending = next.then(() => {}, () => {});
-      return next;
+    isLocked(): boolean {
+      return locked;
+    },
+    async run<T>(fn: () => Promise<T>): Promise<T> {
+      locked = true;
+      try {
+        return await fn();
+      } finally {
+        locked = false;
+      }
     },
   };
 }
@@ -235,8 +241,19 @@ export function createBridgeServer(opts: BridgeOptions) {
       }
     }
 
+    const agentMutex = getMutex(agent);
+    if (agentMutex.isLocked()) {
+      logger.warn(`bridge: agent=${agent} mutex locked, returning busy`);
+      if (isStreaming) {
+        sseFullMessage(res, `⏳ Agent is busy processing another request. Please wait and try again.`, model);
+      } else {
+        jsonResponse(res, 429, openAiError("Agent is busy (mutex locked)", "rate_limit_error"));
+      }
+      return;
+    }
+
     try {
-      const result = await getMutex(agent).run(async () => {
+      const result = await agentMutex.run(async () => {
         // Resolve the effective model: command override > request body
         const cmdModel = commandHandler.getModelForConversation(agent);
         const effectiveModel = cmdModel ?? (model !== "claude-code-cli" ? model : undefined);
