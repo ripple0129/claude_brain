@@ -148,7 +148,15 @@ function openAiError(message: string, type: string, code: string | null = null):
 
 export function createBridgeServer(opts: BridgeOptions) {
   const { port, sessionStore, commandHandler, logger, models } = opts;
-  const mutex = createMutex();
+  const agentMutexes = new Map<string, ReturnType<typeof createMutex>>();
+  const getMutex = (agent: string) => {
+    let m = agentMutexes.get(agent);
+    if (!m) {
+      m = createMutex();
+      agentMutexes.set(agent, m);
+    }
+    return m;
+  };
   let server: Server | null = null;
 
   const modelList: ModelInfo[] = models ?? [
@@ -228,7 +236,7 @@ export function createBridgeServer(opts: BridgeOptions) {
     }
 
     try {
-      const result = await mutex.run(async () => {
+      const result = await getMutex(agent).run(async () => {
         // Resolve the effective model: command override > request body
         const cmdModel = commandHandler.getModelForConversation(agent);
         const effectiveModel = cmdModel ?? (model !== "claude-code-cli" ? model : undefined);
