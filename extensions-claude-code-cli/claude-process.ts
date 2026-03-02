@@ -19,9 +19,26 @@ export type ClaudeProcessOptions = {
   label?: string;
 };
 
+export type TurnUsage = {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+};
+
+export type ToolActivity = {
+  name: string;
+  id: string;
+};
+
 export type SendMessageResult = {
   text: string;
   sessionId: string;
+  usage?: TurnUsage;
+  toolsUsed?: ToolActivity[];
+  costUsd?: number;
+  numTurns?: number;
+  durationMs?: number;
 };
 
 const DEFAULT_CLAUDE_PATH = "claude";
@@ -48,6 +65,12 @@ export class ClaudeProcess {
   private turnProseText = "";
   private turnOnText: ((text: string) => void) | null = null;
   private turnTimeout: ReturnType<typeof setTimeout> | null = null;
+  private turnUsage: TurnUsage = { input_tokens: 0, output_tokens: 0 };
+  private turnToolsUsed: ToolActivity[] = [];
+  private seenToolIds = new Set<string>();
+  private turnCostUsd: number | undefined;
+  private turnNumTurns: number | undefined;
+  private turnDurationMs: number | undefined;
 
   private tag: string;
 
@@ -178,6 +201,12 @@ export class ClaudeProcess {
 
     this.turnProseText = "";
     this.turnOnText = onText ?? null;
+    this.turnUsage = { input_tokens: 0, output_tokens: 0 };
+    this.turnToolsUsed = [];
+    this.seenToolIds.clear();
+    this.turnCostUsd = undefined;
+    this.turnNumTurns = undefined;
+    this.turnDurationMs = undefined;
 
     return new Promise<SendMessageResult>((resolve, reject) => {
       this.turnResolve = resolve;
@@ -240,9 +269,15 @@ export class ClaudeProcess {
       this.turnResolve = null;
       this.turnReject = null;
       this.turnOnText = null;
+      const hasUsage = this.turnUsage.input_tokens > 0 || this.turnUsage.output_tokens > 0;
       resolve({
         text: this.turnProseText,
         sessionId: this.sessionId,
+        usage: hasUsage ? { ...this.turnUsage } : undefined,
+        toolsUsed: this.turnToolsUsed.length > 0 ? [...this.turnToolsUsed] : undefined,
+        costUsd: this.turnCostUsd,
+        numTurns: this.turnNumTurns,
+        durationMs: this.turnDurationMs,
       });
     }
   }
@@ -278,9 +313,10 @@ export class ClaudeProcess {
       return;
     }
 
-    // Streaming text delta — Claude's prose (only thing we send to chat)
+    // Streaming events — prose text + usage tracking
     if (eventType === "stream_event") {
       const inner = event.event as Record<string, unknown> | undefined;
+
       if (inner?.type === "content_block_delta") {
         const delta = inner.delta as Record<string, unknown> | undefined;
         if (delta?.type === "text_delta" && typeof delta.text === "string") {
@@ -289,11 +325,46 @@ export class ClaudeProcess {
           this.turnOnText?.(text);
         }
       }
+
+      // message_start carries input token counts
+      if (inner?.type === "message_start") {
+        const msgUsage = (inner.message as Record<string, unknown>)?.usage as Record<string, number> | undefined;
+        if (msgUsage) {
+          if (msgUsage.input_tokens) this.turnUsage.input_tokens += msgUsage.input_tokens;
+          if (msgUsage.cache_read_input_tokens) {
+            this.turnUsage.cache_read_input_tokens = (this.turnUsage.cache_read_input_tokens ?? 0) + msgUsage.cache_read_input_tokens;
+          }
+          if (msgUsage.cache_creation_input_tokens) {
+            this.turnUsage.cache_creation_input_tokens = (this.turnUsage.cache_creation_input_tokens ?? 0) + msgUsage.cache_creation_input_tokens;
+          }
+        }
+      }
+
+      // message_delta carries output token counts
+      if (inner?.type === "message_delta") {
+        const deltaUsage = (inner as Record<string, unknown>).usage as Record<string, number> | undefined;
+        if (deltaUsage?.output_tokens) {
+          this.turnUsage.output_tokens += deltaUsage.output_tokens;
+        }
+      }
+
       return;
     }
 
-    // Silently skip tool calls and tool results (prose-only strategy)
-    if (eventType === "assistant" || eventType === "user") {
+    // Extract tool activity from assistant messages, skip user messages
+    if (eventType === "assistant") {
+      const content = (event.message as Record<string, unknown>)?.content;
+      if (Array.isArray(content)) {
+        for (const block of content as Record<string, unknown>[]) {
+          if (block.type === "tool_use" && typeof block.id === "string" && !this.seenToolIds.has(block.id as string)) {
+            this.seenToolIds.add(block.id as string);
+            this.turnToolsUsed.push({ name: String(block.name), id: block.id as string });
+          }
+        }
+      }
+      return;
+    }
+    if (eventType === "user") {
       return;
     }
 
@@ -305,13 +376,27 @@ export class ClaudeProcess {
 
       if (typeof event.total_cost_usd === "number") {
         this.totalCostUsd += event.total_cost_usd as number;
+        this.turnCostUsd = event.total_cost_usd as number;
+      }
+      if (typeof event.num_turns === "number") {
+        this.turnNumTurns = event.num_turns as number;
+      }
+      if (typeof event.duration_ms === "number") {
+        this.turnDurationMs = event.duration_ms as number;
       }
 
-      const costUsd = typeof event.total_cost_usd === "number"
-        ? (event.total_cost_usd as number).toFixed(4)
-        : "?";
-      const numTurns = event.num_turns ?? "?";
-      const durationMs = event.duration_ms ?? "?";
+      // Fallback: if stream events didn't provide usage, try result.usage
+      const resultUsage = (event as Record<string, unknown>).usage as Record<string, number> | undefined;
+      if (resultUsage && this.turnUsage.input_tokens === 0 && this.turnUsage.output_tokens === 0) {
+        if (resultUsage.input_tokens) this.turnUsage.input_tokens = resultUsage.input_tokens;
+        if (resultUsage.output_tokens) this.turnUsage.output_tokens = resultUsage.output_tokens;
+        if (resultUsage.cache_read_input_tokens) this.turnUsage.cache_read_input_tokens = resultUsage.cache_read_input_tokens;
+        if (resultUsage.cache_creation_input_tokens) this.turnUsage.cache_creation_input_tokens = resultUsage.cache_creation_input_tokens;
+      }
+
+      const costUsd = this.turnCostUsd !== undefined ? this.turnCostUsd.toFixed(4) : "?";
+      const numTurns = this.turnNumTurns ?? "?";
+      const durationMs = this.turnDurationMs ?? "?";
 
       if (event.is_error || event.subtype === "error_during_execution") {
         const errors = event.errors as string[] | undefined;
@@ -332,10 +417,18 @@ export class ClaudeProcess {
         }
       }
 
+      const usageStr = (this.turnUsage.input_tokens > 0 || this.turnUsage.output_tokens > 0)
+        ? ` in=${this.turnUsage.input_tokens} out=${this.turnUsage.output_tokens}`
+        : "";
+      const toolStr = this.turnToolsUsed.length > 0
+        ? ` tools=[${this.turnToolsUsed.map(t => t.name).join(",")}]`
+        : "";
+
       log.info(
         `${this.tag}: turn complete sid=${this.sessionId.slice(0, 12)} ` +
         `proseLen=${this.turnProseText.length} ` +
-        `turns=${numTurns} cost=$${costUsd} dur=${durationMs}ms`,
+        `turns=${numTurns} cost=$${costUsd} dur=${durationMs}ms` +
+        usageStr + toolStr,
       );
 
       this.completeTurn();

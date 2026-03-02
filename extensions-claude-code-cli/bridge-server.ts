@@ -116,14 +116,14 @@ function sseDelta(res: ServerResponse, id: string, created: number, model: strin
   res.write(`data: ${JSON.stringify(chunk)}\n\n`);
 }
 
-function sseFinish(res: ServerResponse, id: string, created: number, model: string): void {
+function sseFinish(res: ServerResponse, id: string, created: number, model: string, usage?: Record<string, number>): void {
   const finishChunk = {
     id,
     object: "chat.completion.chunk",
     created,
     model,
     choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    usage: usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   };
   res.write(`data: ${JSON.stringify(finishChunk)}\n\n`);
   res.write("data: [DONE]\n\n");
@@ -279,18 +279,27 @@ export function createBridgeServer(opts: BridgeOptions) {
         const sseId = `chatcmpl-${Date.now()}`;
         const sseCreated = Math.floor(Date.now() / 1000);
 
-        // For streaming: send SSE headers and keep-alive
+        // For streaming: send SSE headers, keep-alive, and abort on client disconnect
         let keepAliveTimer: ReturnType<typeof setInterval> | null = null;
+        let clientDisconnected = false;
         if (isStreaming) {
           sseStart(res);
           keepAliveTimer = setInterval(() => {
             sseDelta(res, sseId, sseCreated, model, "");
           }, 5000);
+          res.on("close", () => {
+            clientDisconnected = true;
+            if (keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; }
+            if (entry?.process.isBusy()) {
+              logger.info(`bridge: client disconnected, aborting turn for agent=${agent}`);
+              entry.process.abortTurn();
+            }
+          });
         }
 
         const onText = isStreaming
           ? (text: string) => {
-              sseDelta(res, sseId, sseCreated, model, text);
+              if (!clientDisconnected) sseDelta(res, sseId, sseCreated, model, text);
             }
           : undefined;
 
@@ -298,6 +307,9 @@ export function createBridgeServer(opts: BridgeOptions) {
         try {
           out = await entry.process.sendMessage(latestUserMsg, onText);
         } catch (err) {
+          // Client disconnect → don't retry, just bail
+          if (clientDisconnected) throw err;
+
           const errMsg = err instanceof Error ? err.message : String(err);
           logger.warn(`bridge: sendMessage failed: ${errMsg}, recreating session...`);
           // Stale persisted session → clear and start fresh
@@ -321,6 +333,12 @@ export function createBridgeServer(opts: BridgeOptions) {
           );
         }
 
+        // Skip remaining SSE writes if client already disconnected
+        if (isStreaming && clientDisconnected) {
+          logger.info(`bridge: skipping SSE finish — client already disconnected`);
+          return { result: out };
+        }
+
         // Upload any local image files (scan prose text)
         if (isStreaming && out) {
           const workDir = process.env.OPENCLAW_WORKSPACE
@@ -336,7 +354,18 @@ export function createBridgeServer(opts: BridgeOptions) {
         }
 
         if (isStreaming) {
-          sseFinish(res, sseId, sseCreated, model);
+          const openaiUsage = out.usage ? {
+            prompt_tokens: out.usage.input_tokens,
+            completion_tokens: out.usage.output_tokens,
+            total_tokens: out.usage.input_tokens + out.usage.output_tokens,
+            cache_read_input_tokens: out.usage.cache_read_input_tokens,
+            cache_creation_input_tokens: out.usage.cache_creation_input_tokens,
+          } : undefined;
+          sseFinish(res, sseId, sseCreated, model, openaiUsage);
+        }
+
+        if (out.toolsUsed?.length) {
+          logger.info(`bridge: tools used: ${out.toolsUsed.map(t => t.name).join(", ")}`);
         }
 
         return { result: out };
@@ -350,18 +379,28 @@ export function createBridgeServer(opts: BridgeOptions) {
         try {
           content = await replaceImagePaths(content, workDir, logger);
         } catch { /* ignore */ }
+        const nonStreamUsage = result.result.usage ? {
+          prompt_tokens: result.result.usage.input_tokens,
+          completion_tokens: result.result.usage.output_tokens,
+          total_tokens: result.result.usage.input_tokens + result.result.usage.output_tokens,
+          cache_read_input_tokens: result.result.usage.cache_read_input_tokens,
+          cache_creation_input_tokens: result.result.usage.cache_creation_input_tokens,
+        } : { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+
         jsonResponse(res, 200, {
           id: `chatcmpl-${Date.now()}`,
           object: "chat.completion",
           created: Math.floor(Date.now() / 1000),
           model,
           choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
-          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+          usage: nonStreamUsage,
         });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
       logger.error(`bridge: REQUEST ERROR msg=${message}`);
+
+      if (res.writableEnded || res.destroyed) return;
 
       if (isStreaming) {
         sseError(res, message);
