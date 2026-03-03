@@ -33,8 +33,9 @@ const DEFAULT_CODEX_MODELS = [
 ];
 
 const DEFAULT_GEMINI_MODELS = [
-  "gemini-3.1-pro",
-  "gemini-3-flash",
+  "gemini-3.1-pro-preview",
+  "gemini-3-pro-preview",
+  "gemini-3-flash-preview",
 ];
 
 type PluginCfg = Record<string, unknown> | undefined;
