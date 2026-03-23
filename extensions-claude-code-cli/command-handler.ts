@@ -293,15 +293,12 @@ export class CommandHandler {
 
   private handleUsage(ctx: CommandContext): void {
     const entry = this.store.getSession(ctx.conversationId);
-    if (!entry || !entry.process.isAlive()) {
-      this.reply(ctx, "目前無活躍的 session");
-      return;
-    }
+    const statusFile = this.readStatusFile();
 
     const lines: string[] = [];
 
-    // Context usage
-    const context = entry.process.getContext();
+    // Context usage — prefer process data, fallback to status file
+    const context = entry?.process.getContext();
     if (context) {
       const used = context.contextTokens;
       const window = context.contextWindow;
@@ -314,35 +311,34 @@ export class CommandHandler {
       if (context.maxOutputTokens) {
         lines.push(`Max output: ${this.formatTokens(context.maxOutputTokens)}`);
       }
-    } else {
-      lines.push("Context: 尚無資料（需先發送訊息）");
+    } else if (statusFile?.context_window) {
+      const cw = statusFile.context_window as { used_percentage?: number; context_window_size?: number };
+      if (cw.used_percentage !== undefined && cw.context_window_size) {
+        lines.push(`Context: ${cw.used_percentage}% of ${this.formatTokens(cw.context_window_size)}`);
+      }
     }
 
-    // Rate limits (per type: five_hour, seven_day)
-    // Merge stream-json rate_limit_event with status line file (for used_percentage)
-    const rateLimits = entry.process.getRateLimits();
-    const statusFile = this.readStatusFile();
-    const win = entry.process.getWindowUsage();
+    // Rate limits — merge process data with status line file fallback
+    const rateLimits = entry?.process.getRateLimits() ?? new Map();
+    const sfRateLimits = statusFile?.rate_limits as Record<string, unknown> | undefined;
+    const win = entry?.process.getWindowUsage();
     const typeLabels: Record<string, string> = { five_hour: "5H Limit", seven_day: "7D Limit" };
-    const statusKeyMap: Record<string, string> = { five_hour: "five_hour", seven_day: "seven_day" };
 
-    // Build merged rate limit entries (stream-json + status file fallback)
+    // Build merged rate limit entries (process + status file fallback)
     const mergedTypes = new Set<string>();
     for (const type of rateLimits.keys()) mergedTypes.add(type);
-    if (statusFile?.five_hour) mergedTypes.add("five_hour");
-    if (statusFile?.seven_day) mergedTypes.add("seven_day");
+    if (sfRateLimits?.five_hour) mergedTypes.add("five_hour");
+    if (sfRateLimits?.seven_day) mergedTypes.add("seven_day");
 
     if (mergedTypes.size > 0) {
       for (const type of mergedTypes) {
         lines.push("");
         const rl = rateLimits.get(type);
-        const sfKey = statusKeyMap[type] ?? type;
-        const sf = statusFile?.[sfKey] as { used_percentage?: number; resets_at?: number } | undefined;
+        const sf = sfRateLimits?.[type] as { used_percentage?: number; resets_at?: number } | undefined;
 
         const label = typeLabels[type] ?? type;
         const statusIcon = rl?.status === "allowed" ? "🟢" : rl?.status === "allowed_warning" ? "🟡" : rl ? "🔴" : "⚪";
 
-        // Prefer stream-json utilization, fallback to status file used_percentage
         const utilization = rl?.utilization ?? (typeof sf?.used_percentage === "number" ? sf.used_percentage / 100 : undefined);
         const pct = utilization !== undefined ? ` ${(utilization * 100).toFixed(0)}% used` : "";
         lines.push(`${statusIcon} ${label}${pct}`);
@@ -351,7 +347,6 @@ export class CommandHandler {
         if (resetsAt) {
           lines.push(`  重置: ${this.formatResetTime(resetsAt)}`);
         }
-        // Show bridge-local window stats for five_hour
         if (type === "five_hour" && win) {
           lines.push(`  本 session: Input ${this.formatTokens(win.inputTokens)} / Output ${this.formatTokens(win.outputTokens)} / $${win.costUsd.toFixed(4)} / ${win.turns} turns`);
         }
@@ -360,28 +355,28 @@ export class CommandHandler {
           lines.push(`  Overage: ${overageIcon} ${rl.overageStatus}${rl.isUsingOverage ? " (使用中)" : ""}`);
         }
       }
-    } else if (win) {
-      lines.push("");
-      lines.push("Rate limit: 尚無資料");
-      lines.push(`  本 session: Input ${this.formatTokens(win.inputTokens)} / Output ${this.formatTokens(win.outputTokens)} / $${win.costUsd.toFixed(4)} / ${win.turns} turns`);
     }
 
-    // Total cost (across all windows)
-    const cost = entry.process.getTotalCost();
-    if (cost > 0) {
+    // Total cost
+    const cost = entry?.process.getTotalCost() ?? (statusFile?.cost as { total_cost_usd?: number })?.total_cost_usd;
+    if (cost !== undefined && cost > 0) {
       lines.push("");
       lines.push(`Session 累計: $${cost.toFixed(4)}`);
+    }
+
+    if (lines.length === 0) {
+      this.reply(ctx, "目前無使用資料");
+      return;
     }
 
     this.reply(ctx, lines.join("\n"));
   }
 
-  /** Read account-level rate limit data from Claude Code status line cache. */
+  /** Read Claude Code status line cache (rate limits, context window, cost). */
   private readStatusFile(): Record<string, unknown> | null {
     try {
       const raw = readFileSync("/tmp/claude-status.json", "utf-8");
-      const data = JSON.parse(raw) as Record<string, unknown>;
-      return (data.rate_limits ?? null) as Record<string, unknown> | null;
+      return JSON.parse(raw) as Record<string, unknown>;
     } catch {
       return null;
     }

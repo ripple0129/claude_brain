@@ -5,6 +5,7 @@ import type {
   ProviderAuthResult,
 } from "openclaw/plugin-sdk";
 import { homedir } from "node:os";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { createBridgeServer } from "./bridge-server.js";
 import { SessionStore } from "./session-store.js";
@@ -168,6 +169,31 @@ function resolveDefaultModel(api: OpenClawPluginApi): string | undefined {
   return undefined;
 }
 
+function readStatusFile(): Record<string, unknown> | null {
+  try {
+    const raw = readFileSync("/tmp/claude-status.json", "utf-8");
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+function fmtResetTime(epochSec: number): string {
+  const now = Math.floor(Date.now() / 1000);
+  const diff = epochSec - now;
+  if (diff <= 0) return "已重置";
+  const h = Math.floor(diff / 3600);
+  const m = Math.floor((diff % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m 後`;
+  return `${m}m 後`;
+}
+
 const plugin = {
   id: "claude-code-cli",
   name: "Claude Code CLI",
@@ -329,6 +355,56 @@ const plugin = {
     };
 
     api.registerService(bridgeService);
+
+    // --- Plugin command registration ---
+    api.registerCommand({
+      name: "limits",
+      description: "顯示 Claude Code rate limit 與 context 用量",
+      acceptsArgs: false,
+      handler: () => {
+        const lines: string[] = [];
+        const statusData = readStatusFile();
+
+        // Context window
+        const cw = statusData?.context_window as { used_percentage?: number; context_window_size?: number } | undefined;
+        if (cw?.used_percentage !== undefined && cw.context_window_size) {
+          lines.push(`Context: ${cw.used_percentage}% of ${fmtTokens(cw.context_window_size)}`);
+        }
+
+        // Rate limits
+        const rl = statusData?.rate_limits as Record<string, { used_percentage?: number; resets_at?: number }> | undefined;
+        const typeLabels: Record<string, string> = { five_hour: "5H Limit", seven_day: "7D Limit" };
+        for (const type of ["five_hour", "seven_day"] as const) {
+          const entry = rl?.[type];
+          if (entry?.used_percentage !== undefined) {
+            lines.push("");
+            const icon = entry.used_percentage < 80 ? "🟢" : entry.used_percentage < 95 ? "🟡" : "🔴";
+            lines.push(`${icon} ${typeLabels[type]} ${entry.used_percentage}% used`);
+            if (entry.resets_at) {
+              lines.push(`  重置: ${fmtResetTime(entry.resets_at)}`);
+            }
+          }
+        }
+
+        // Model
+        const model = statusData?.model as { display_name?: string } | undefined;
+        if (model?.display_name) {
+          lines.push("");
+          lines.push(`Model: ${model.display_name}`);
+        }
+
+        // Cost
+        const cost = statusData?.cost as { total_cost_usd?: number } | undefined;
+        if (cost?.total_cost_usd !== undefined && cost.total_cost_usd > 0) {
+          lines.push(`Cost: $${cost.total_cost_usd.toFixed(4)}`);
+        }
+
+        if (lines.length === 0) {
+          return { text: "目前無使用資料（需有 Claude Code session 執行中）" };
+        }
+        return { text: lines.join("\n") };
+      },
+    });
   },
 };
 
