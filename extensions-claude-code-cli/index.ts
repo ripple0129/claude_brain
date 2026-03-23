@@ -358,7 +358,7 @@ const plugin = {
 
     // --- Plugin command registration ---
     api.registerCommand({
-      name: "limits",
+      name: "hud",
       description: "顯示 Claude Code rate limit 與 context 用量",
       acceptsArgs: false,
       handler: () => {
