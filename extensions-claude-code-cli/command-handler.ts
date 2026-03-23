@@ -79,6 +79,9 @@ export class CommandHandler {
       case "cost":
         this.handleCost(ctx);
         return { handled: true };
+      case "usage":
+        this.handleUsage(ctx);
+        return { handled: true };
       default:
         return { handled: false };
     }
@@ -95,6 +98,7 @@ export class CommandHandler {
       { id: "resume", name: "Resume", description: "恢復 session (可帶 ID: /resume <id>)" },
       { id: "model", name: "Model", description: "切換模型" },
       { id: "cost", name: "Cost", description: "顯示累計花費 / token 用量" },
+      { id: "usage", name: "Usage", description: "顯示 context 用量與 rate limit 狀態" },
       { id: "compact", name: "Compact", description: "壓縮對話上下文" },
     ];
   }
@@ -185,6 +189,7 @@ export class CommandHandler {
       "/resume [id] — 恢復 session",
       "/model [name] — 切換模型",
       "/cost — 顯示累計花費 / token 用量",
+      "/usage — 顯示 context 用量與 rate limit 狀態",
       "/compact — 壓縮對話上下文",
       "/help — 列出所有可用指令",
     ];
@@ -284,6 +289,89 @@ export class CommandHandler {
     });
 
     this.reply(ctx, "已壓縮對話上下文");
+  }
+
+  private handleUsage(ctx: CommandContext): void {
+    const entry = this.store.getSession(ctx.conversationId);
+    if (!entry || !entry.process.isAlive()) {
+      this.reply(ctx, "目前無活躍的 session");
+      return;
+    }
+
+    const lines: string[] = [];
+
+    // Context usage
+    const context = entry.process.getContext();
+    if (context) {
+      const used = context.contextTokens;
+      const window = context.contextWindow;
+      if (window) {
+        const pct = ((used / window) * 100).toFixed(1);
+        lines.push(`Context: ${this.formatTokens(used)} / ${this.formatTokens(window)} (${pct}%)`);
+      } else {
+        lines.push(`Context: ${this.formatTokens(used)}`);
+      }
+      if (context.maxOutputTokens) {
+        lines.push(`Max output: ${this.formatTokens(context.maxOutputTokens)}`);
+      }
+    } else {
+      lines.push("Context: 尚無資料（需先發送訊息）");
+    }
+
+    // Rate limits (per type: five_hour, seven_day)
+    const rateLimits = entry.process.getRateLimits();
+    const win = entry.process.getWindowUsage();
+    const typeLabels: Record<string, string> = { five_hour: "5H Limit", seven_day: "7D Limit" };
+
+    if (rateLimits.size > 0) {
+      for (const [type, rl] of rateLimits) {
+        lines.push("");
+        const label = typeLabels[type] ?? type;
+        const statusIcon = rl.status === "allowed" ? "🟢" : rl.status === "allowed_warning" ? "🟡" : "🔴";
+        const pct = rl.utilization !== undefined ? ` ${(rl.utilization * 100).toFixed(0)}% used` : "";
+        lines.push(`${statusIcon} ${label}${pct}`);
+        if (rl.resetsAt) {
+          lines.push(`  重置: ${this.formatResetTime(rl.resetsAt)}`);
+        }
+        // Show bridge-local window stats for five_hour
+        if (type === "five_hour" && win) {
+          lines.push(`  本 session: Input ${this.formatTokens(win.inputTokens)} / Output ${this.formatTokens(win.outputTokens)} / $${win.costUsd.toFixed(4)} / ${win.turns} turns`);
+        }
+        if (rl.overageStatus) {
+          const overageIcon = rl.overageStatus === "allowed" ? "🟢" : "🔴";
+          lines.push(`  Overage: ${overageIcon} ${rl.overageStatus}${rl.isUsingOverage ? " (使用中)" : ""}`);
+        }
+      }
+    } else if (win) {
+      lines.push("");
+      lines.push("Rate limit: 尚無資料");
+      lines.push(`  本 session: Input ${this.formatTokens(win.inputTokens)} / Output ${this.formatTokens(win.outputTokens)} / $${win.costUsd.toFixed(4)} / ${win.turns} turns`);
+    }
+
+    // Total cost (across all windows)
+    const cost = entry.process.getTotalCost();
+    if (cost > 0) {
+      lines.push("");
+      lines.push(`Session 累計: $${cost.toFixed(4)}`);
+    }
+
+    this.reply(ctx, lines.join("\n"));
+  }
+
+  private formatTokens(n: number): string {
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+    return String(n);
+  }
+
+  private formatResetTime(epochSec: number): string {
+    const now = Math.floor(Date.now() / 1000);
+    const diff = epochSec - now;
+    if (diff <= 0) return "已重置";
+    const h = Math.floor(diff / 3600);
+    const m = Math.floor((diff % 3600) / 60);
+    if (h > 0) return `${h}h ${m}m 後`;
+    return `${m}m 後`;
   }
 
   private handleCost(ctx: CommandContext): void {

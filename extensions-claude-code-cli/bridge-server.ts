@@ -116,7 +116,7 @@ function sseDelta(res: ServerResponse, id: string, created: number, model: strin
   res.write(`data: ${JSON.stringify(chunk)}\n\n`);
 }
 
-function sseFinish(res: ServerResponse, id: string, created: number, model: string, usage?: Record<string, number>): void {
+function sseFinish(res: ServerResponse, id: string, created: number, model: string, usage?: Record<string, number>, extra?: Record<string, unknown>): void {
   const finishChunk = {
     id,
     object: "chat.completion.chunk",
@@ -124,6 +124,7 @@ function sseFinish(res: ServerResponse, id: string, created: number, model: stri
     model,
     choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
     usage: usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    ...extra,
   };
   res.write(`data: ${JSON.stringify(finishChunk)}\n\n`);
   res.write("data: [DONE]\n\n");
@@ -361,7 +362,13 @@ export function createBridgeServer(opts: BridgeOptions) {
             cache_read_input_tokens: out.usage.cache_read_input_tokens,
             cache_creation_input_tokens: out.usage.cache_creation_input_tokens,
           } : undefined;
-          sseFinish(res, sseId, sseCreated, model, openaiUsage);
+          const extra: Record<string, unknown> = {};
+          if (out.costUsd !== undefined) extra.cost_usd = out.costUsd;
+          if (out.rateLimit) extra.rate_limit = out.rateLimit;
+          if (out.numTurns !== undefined) extra.num_turns = out.numTurns;
+          if (out.durationMs !== undefined) extra.duration_ms = out.durationMs;
+          if (out.context) extra.context = out.context;
+          sseFinish(res, sseId, sseCreated, model, openaiUsage, Object.keys(extra).length > 0 ? extra : undefined);
         }
 
         if (out.toolsUsed?.length) {
@@ -387,6 +394,13 @@ export function createBridgeServer(opts: BridgeOptions) {
           cache_creation_input_tokens: result.result.usage.cache_creation_input_tokens,
         } : { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
 
+        const nonStreamExtra: Record<string, unknown> = {};
+        if (result.result.costUsd !== undefined) nonStreamExtra.cost_usd = result.result.costUsd;
+        if (result.result.rateLimit) nonStreamExtra.rate_limit = result.result.rateLimit;
+        if (result.result.numTurns !== undefined) nonStreamExtra.num_turns = result.result.numTurns;
+        if (result.result.durationMs !== undefined) nonStreamExtra.duration_ms = result.result.durationMs;
+        if (result.result.context) nonStreamExtra.context = result.result.context;
+
         jsonResponse(res, 200, {
           id: `chatcmpl-${Date.now()}`,
           object: "chat.completion",
@@ -394,6 +408,7 @@ export function createBridgeServer(opts: BridgeOptions) {
           model,
           choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
           usage: nonStreamUsage,
+          ...nonStreamExtra,
         });
       }
     } catch (err) {
