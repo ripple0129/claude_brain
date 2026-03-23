@@ -79,7 +79,7 @@ export class CommandHandler {
       case "cost":
         this.handleCost(ctx);
         return { handled: true };
-      case "usage":
+      case "limits":
         this.handleUsage(ctx);
         return { handled: true };
       default:
@@ -98,7 +98,7 @@ export class CommandHandler {
       { id: "resume", name: "Resume", description: "恢復 session (可帶 ID: /resume <id>)" },
       { id: "model", name: "Model", description: "切換模型" },
       { id: "cost", name: "Cost", description: "顯示累計花費 / token 用量" },
-      { id: "usage", name: "Usage", description: "顯示 context 用量與 rate limit 狀態" },
+      { id: "limits", name: "Limits", description: "顯示 context 用量與 rate limit 狀態" },
       { id: "compact", name: "Compact", description: "壓縮對話上下文" },
     ];
   }
@@ -189,7 +189,7 @@ export class CommandHandler {
       "/resume [id] — 恢復 session",
       "/model [name] — 切換模型",
       "/cost — 顯示累計花費 / token 用量",
-      "/usage — 顯示 context 用量與 rate limit 狀態",
+      "/limits — 顯示 context 用量與 rate limit 狀態",
       "/compact — 壓縮對話上下文",
       "/help — 列出所有可用指令",
     ];
