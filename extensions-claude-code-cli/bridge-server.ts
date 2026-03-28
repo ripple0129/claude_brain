@@ -34,8 +34,8 @@ type ChatMessage = {
 
 /** Strip OpenClaw's injected metadata block, returning only the user's actual message. */
 function stripMetadata(msg: string): string {
-  // Remove "Conversation info (untrusted metadata):\n```json\n{...}\n```\n" block
-  return msg.replace(/Conversation info \(untrusted metadata\):\s*```json\s*\{[\s\S]*?\}\s*```\s*/g, "").trim();
+  // Remove any "(untrusted metadata):" block with fenced JSON
+  return msg.replace(/\w[\w\s]*\(untrusted metadata\):\s*```json\s*[\s\S]*?```\s*/g, "").trim();
 }
 
 /** Extract sender metadata from OpenClaw's injected conversation info. */
