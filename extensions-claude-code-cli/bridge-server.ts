@@ -1,6 +1,9 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { readFileSync } from "node:fs";
 import type { SessionStore } from "./session-store.js";
 import type { CommandHandler } from "./command-handler.js";
+import type { HudMonitor } from "./hud-monitor.js";
+import { type HudWebSocket, type HudData, formatResetIn } from "./hud-ws.js";
 import { findAndUploadImages, replaceImagePaths } from "./image-replacer.js";
 
 type Logger = {
@@ -17,6 +20,8 @@ type BridgeOptions = {
   commandHandler: CommandHandler;
   logger: Logger;
   models?: ModelInfo[];
+  hudMonitor?: HudMonitor;
+  hudWs?: HudWebSocket;
 };
 
 type ContentBlock = { type: string; text?: string };
@@ -27,12 +32,43 @@ type ChatMessage = {
   content: MessageContent;
 };
 
+/** Strip OpenClaw's injected metadata block, returning only the user's actual message. */
+function stripMetadata(msg: string): string {
+  // Remove "Conversation info (untrusted metadata):\n```json\n{...}\n```\n" block
+  return msg.replace(/Conversation info \(untrusted metadata\):\s*```json\s*\{[\s\S]*?\}\s*```\s*/g, "").trim();
+}
+
+/** Extract sender metadata from OpenClaw's injected conversation info. */
+function extractSenderMeta(msg: string): { conversationId?: string; agentName?: string } | null {
+  // Handle both escaped (\"key\":\"val\") and unescaped ("key":"val") quotes
+  const convMatch = msg.match(/\\?"conversationId\\?"\s*:\s*\\?"([0-9a-f-]+)\\?"/);
+  const agentMatch = msg.match(/\\?"agentName\\?"\s*:\s*\\?"([^"\\]+)\\?"/);
+  if (!convMatch && !agentMatch) return null;
+  return {
+    conversationId: convMatch?.[1],
+    agentName: agentMatch?.[1],
+  };
+}
+
+
 function parseModelId(raw: string): { agent: string; model: string } {
   const match = raw.match(/^(.+?)\(([^)]+)\)$/);
   if (match) {
     return { agent: match[2].toLowerCase(), model: match[1] };
   }
   return { agent: "default", model: raw };
+}
+
+const MODEL_NAMES: Record<string, string> = {
+  "claude-opus-4-6": "Opus 4.6",
+  "claude-sonnet-4-6": "Sonnet 4.6",
+  "claude-haiku-4-5-20251001": "Haiku 4.5",
+  "claude-sonnet-4-5-20250514": "Sonnet 4.5",
+  "claude-opus-4-20250514": "Opus 4",
+};
+
+function formatModelName(modelId: string): string {
+  return MODEL_NAMES[modelId] ?? modelId;
 }
 
 function contentToString(content: MessageContent): string {
@@ -154,7 +190,7 @@ function openAiError(message: string, type: string, code: string | null = null):
 }
 
 export function createBridgeServer(opts: BridgeOptions) {
-  const { port, sessionStore, commandHandler, logger, models } = opts;
+  const { port, sessionStore, commandHandler, logger, models, hudMonitor, hudWs } = opts;
   const agentMutexes = new Map<string, ReturnType<typeof createMutex>>();
   const getMutex = (agent: string) => {
     let m = agentMutexes.get(agent);
@@ -212,15 +248,30 @@ export function createBridgeServer(opts: BridgeOptions) {
       return;
     }
 
+    // Extract conversationId and agentName from OpenClaw metadata
+    const senderMeta = extractSenderMeta(latestUserMsg);
+    // Use agentName as session key — session follows the person, not the conversation.
+    // This ensures context persists across private chats and group chats.
+    // Fallback: if agentName is missing but conversationId is present, resolve via mapping.
+    const resolvedAgent = senderMeta?.agentName
+      ?? (senderMeta?.conversationId ? sessionStore.resolveAgent(senderMeta.conversationId) : undefined)
+      ?? agent;
+    const sessionKey = resolvedAgent;
+    // Use agentName for workspace resolution (workspace-linda, workspace-default, etc.)
+    const agentForCwd = resolvedAgent;
+    if (senderMeta?.conversationId && senderMeta.agentName) {
+      sessionStore.mapConversation(senderMeta.conversationId, senderMeta.agentName);
+    }
+
     logger.info(
-      `bridge: request — agent=${agent} model=${model} msgs=${messages.length} msg="${latestUserMsg.slice(0, 80)}${latestUserMsg.length > 80 ? "..." : ""}"`,
+      `bridge: request — session=${sessionKey} agent=${agentForCwd} model=${model} meta=${JSON.stringify(senderMeta)}`,
     );
 
     // Try command handling first (handles /new, /reset, etc.)
     if (latestUserMsg.trim().startsWith("/")) {
       let cmdReply = "";
       const cmdResult = await commandHandler.handle(latestUserMsg, {
-        conversationId: agent,
+        conversationId: sessionKey,
         sendChunk: (text) => { cmdReply = text; },
         sendComplete: (text) => { cmdReply = text; },
         sendError: (text) => { cmdReply = `Error: ${text}`; },
@@ -242,9 +293,9 @@ export function createBridgeServer(opts: BridgeOptions) {
       }
     }
 
-    const agentMutex = getMutex(agent);
-    if (agentMutex.isLocked()) {
-      logger.warn(`bridge: agent=${agent} mutex locked, returning busy`);
+    const sessionMutex = getMutex(sessionKey);
+    if (sessionMutex.isLocked()) {
+      logger.warn(`bridge: session=${sessionKey} mutex locked, returning busy`);
       if (isStreaming) {
         sseFullMessage(res, `⏳ Agent is busy processing another request. Please wait and try again.`, model);
       } else {
@@ -254,25 +305,25 @@ export function createBridgeServer(opts: BridgeOptions) {
     }
 
     try {
-      const result = await agentMutex.run(async () => {
+      const result = await sessionMutex.run(async () => {
         // Resolve the effective model: command override > request body
-        const cmdModel = commandHandler.getModelForConversation(agent);
+        const cmdModel = commandHandler.getModelForConversation(sessionKey);
         const effectiveModel = cmdModel ?? (model !== "claude-code-cli" ? model : undefined);
         const requestedBackend = sessionStore.resolveBackend(effectiveModel);
 
-        // Ensure session exists for this agent
-        let entry = sessionStore.getSession(agent);
+        // Ensure session exists for this conversation
+        let entry = sessionStore.getSession(sessionKey);
 
         // Backend mismatch → destroy and recreate
         if (entry && entry.process.isAlive() && entry.backend !== requestedBackend) {
           logger.info(`bridge: backend mismatch (${entry.backend} → ${requestedBackend}), recreating session`);
-          await sessionStore.destroySession(agent);
+          await sessionStore.destroySession(sessionKey);
           entry = undefined;
         }
 
         if (!entry || !entry.process.isAlive()) {
-          const cwd = commandHandler.getCwdForConversation(agent);
-          entry = sessionStore.createSession(agent, { cwd, model: effectiveModel });
+          const cwd = commandHandler.getCwdForConversation(agentForCwd);
+          entry = sessionStore.createSession(sessionKey, { cwd, model: effectiveModel });
         } else {
           entry.lastActivity = Date.now();
         }
@@ -292,7 +343,7 @@ export function createBridgeServer(opts: BridgeOptions) {
             clientDisconnected = true;
             if (keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; }
             if (entry?.process.isBusy()) {
-              logger.info(`bridge: client disconnected, aborting turn for agent=${agent}`);
+              logger.info(`bridge: client disconnected, aborting turn for session=${sessionKey}`);
               entry.process.abortTurn();
             }
           });
@@ -304,6 +355,9 @@ export function createBridgeServer(opts: BridgeOptions) {
             }
           : undefined;
 
+        // Push task started
+        if (hudWs) hudWs.sendTask(sessionKey, { status: "started", task: stripMetadata(latestUserMsg).slice(0, 200) });
+
         let out;
         try {
           out = await entry.process.sendMessage(latestUserMsg, onText);
@@ -314,10 +368,10 @@ export function createBridgeServer(opts: BridgeOptions) {
           const errMsg = err instanceof Error ? err.message : String(err);
           logger.warn(`bridge: sendMessage failed: ${errMsg}, recreating session...`);
           // Stale persisted session → clear and start fresh
-          sessionStore.clearPersistedSession(agent);
-          await sessionStore.destroySession(agent);
-          const cwd = commandHandler.getCwdForConversation(agent);
-          entry = sessionStore.createSession(agent, { cwd, model: effectiveModel });
+          sessionStore.clearPersistedSession(sessionKey);
+          await sessionStore.destroySession(sessionKey);
+          const cwd = commandHandler.getCwdForConversation(agentForCwd);
+          entry = sessionStore.createSession(sessionKey, { cwd, model: effectiveModel });
           out = await entry.process.sendMessage(latestUserMsg, onText);
         }
 
@@ -326,7 +380,7 @@ export function createBridgeServer(opts: BridgeOptions) {
         // Persist session ID for cross-restart resume
         if (out.sessionId) {
           sessionStore.persistSession(
-            agent,
+            sessionKey,
             out.sessionId,
             entry.backend,
             entry.model,
@@ -375,8 +429,50 @@ export function createBridgeServer(opts: BridgeOptions) {
           logger.info(`bridge: tools used: ${out.toolsUsed.map(t => t.name).join(", ")}`);
         }
 
-        return { result: out };
+        // Push task completed
+        if (hudWs) hudWs.sendTask(sessionKey, {
+          status: "completed",
+          durationMs: out.durationMs,
+          costUsd: out.costUsd,
+          numTurns: out.numTurns,
+        });
+
+        // Snapshot context & model inside mutex (process may be recreated later)
+        const hudContext = entry.process.getContext();
+        const hudModel = formatModelName(entry.process.getModel() ?? model);
+
+        return { result: out, hudContext, hudModel };
       });
+
+      // HUD push outside mutex — notify + read status file + send WS
+      if (hudWs && senderMeta?.conversationId) {
+        // Fire and forget: don't block the response
+        (async () => {
+          if (hudMonitor) await hudMonitor.notify();
+          const hudData: HudData = {};
+
+          // Context from process snapshot
+          if (result.hudContext) {
+            const total = result.hudContext.contextWindow ?? 0;
+            hudData.context = {
+              used: result.hudContext.contextTokens,
+              total,
+              percent: total ? Math.round((result.hudContext.contextTokens / total) * 100) : 0,
+            };
+          }
+
+          // Rate limits from status file
+          try {
+            const sf = JSON.parse(readFileSync("/tmp/claude-status.json", "utf-8")) as Record<string, unknown>;
+            if (sf.limit5h) hudData.limit5h = sf.limit5h as HudData["limit5h"];
+            if (sf.limit7d) hudData.limit7d = sf.limit7d as HudData["limit7d"];
+          } catch { /* status file unavailable */ }
+
+          hudData.model = result.hudModel;
+          logger.info(`hud-ws: sending hud_update convId=${senderMeta.conversationId!.slice(0, 8)} data=${JSON.stringify(hudData)}`);
+          hudWs.send(senderMeta.conversationId!, hudData);
+        })().catch((err) => logger.warn(`hud-ws: push failed — ${err}`));
+      }
 
       // Non-streaming response
       if (!isStreaming) {

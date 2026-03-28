@@ -11,5 +11,8 @@
     "extensions": [
       "./index.ts"
     ]
+  },
+  "dependencies": {
+    "node-pty": "^1.2.0-beta.12"
   }
 }

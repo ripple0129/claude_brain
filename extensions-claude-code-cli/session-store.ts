@@ -58,6 +58,8 @@ const PERSIST_DEBOUNCE_MS = 500;
  */
 export class SessionStore {
   private sessions = new Map<string, SessionEntry>();
+  /** Mapping: conversationId (UUID) → agent name for /hud lookups. */
+  private convToAgent = new Map<string, string>();
   /** Preserved session IDs from destroyed sessions (for /resume). */
   private deadSessionIds = new Map<string, { sessionId: string; cwd: string; model?: string; backend: Backend }>();
   private config: SessionStoreConfig;
@@ -179,6 +181,16 @@ export class SessionStore {
 
   getSession(conversationId: string): SessionEntry | undefined {
     return this.sessions.get(conversationId);
+  }
+
+  /** Store conversationId → agent name mapping. */
+  mapConversation(conversationId: string, agentName: string): void {
+    this.convToAgent.set(conversationId, agentName);
+  }
+
+  /** Resolve conversationId (UUID) to agent name. */
+  resolveAgent(conversationId: string): string | undefined {
+    return this.convToAgent.get(conversationId);
   }
 
   getLastSessionId(conversationId: string): string | undefined {

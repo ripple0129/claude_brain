@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
 import type { SessionStore } from "./session-store.js";
@@ -79,9 +79,6 @@ export class CommandHandler {
       case "cost":
         this.handleCost(ctx);
         return { handled: true };
-      case "hud":
-        this.handleUsage(ctx);
-        return { handled: true };
       default:
         return { handled: false };
     }
@@ -98,7 +95,6 @@ export class CommandHandler {
       { id: "resume", name: "Resume", description: "恢復 session (可帶 ID: /resume <id>)" },
       { id: "model", name: "Model", description: "切換模型" },
       { id: "cost", name: "Cost", description: "顯示累計花費 / token 用量" },
-      { id: "hud", name: "HUD", description: "顯示 context 用量與 rate limit 狀態" },
       { id: "compact", name: "Compact", description: "壓縮對話上下文" },
     ];
   }
@@ -189,7 +185,6 @@ export class CommandHandler {
       "/resume [id] — 恢復 session",
       "/model [name] — 切換模型",
       "/cost — 顯示累計花費 / token 用量",
-      "/hud — 顯示 context 用量與 rate limit 狀態",
       "/compact — 壓縮對話上下文",
       "/help — 列出所有可用指令",
     ];
@@ -289,113 +284,6 @@ export class CommandHandler {
     });
 
     this.reply(ctx, "已壓縮對話上下文");
-  }
-
-  private handleUsage(ctx: CommandContext): void {
-    const entry = this.store.getSession(ctx.conversationId);
-    const statusFile = this.readStatusFile();
-
-    const lines: string[] = [];
-
-    // Context usage — prefer process data, fallback to status file
-    const context = entry?.process.getContext();
-    if (context) {
-      const used = context.contextTokens;
-      const window = context.contextWindow;
-      if (window) {
-        const pct = ((used / window) * 100).toFixed(1);
-        lines.push(`Context: ${this.formatTokens(used)} / ${this.formatTokens(window)} (${pct}%)`);
-      } else {
-        lines.push(`Context: ${this.formatTokens(used)}`);
-      }
-      if (context.maxOutputTokens) {
-        lines.push(`Max output: ${this.formatTokens(context.maxOutputTokens)}`);
-      }
-    } else if (statusFile?.context_window) {
-      const cw = statusFile.context_window as { used_percentage?: number; context_window_size?: number };
-      if (cw.used_percentage !== undefined && cw.context_window_size) {
-        lines.push(`Context: ${cw.used_percentage}% of ${this.formatTokens(cw.context_window_size)}`);
-      }
-    }
-
-    // Rate limits — merge process data with status line file fallback
-    const rateLimits = entry?.process.getRateLimits() ?? new Map();
-    const sfRateLimits = statusFile?.rate_limits as Record<string, unknown> | undefined;
-    const win = entry?.process.getWindowUsage();
-    const typeLabels: Record<string, string> = { five_hour: "5H Limit", seven_day: "7D Limit" };
-
-    // Build merged rate limit entries (process + status file fallback)
-    const mergedTypes = new Set<string>();
-    for (const type of rateLimits.keys()) mergedTypes.add(type);
-    if (sfRateLimits?.five_hour) mergedTypes.add("five_hour");
-    if (sfRateLimits?.seven_day) mergedTypes.add("seven_day");
-
-    if (mergedTypes.size > 0) {
-      for (const type of mergedTypes) {
-        lines.push("");
-        const rl = rateLimits.get(type);
-        const sf = sfRateLimits?.[type] as { used_percentage?: number; resets_at?: number } | undefined;
-
-        const label = typeLabels[type] ?? type;
-        const statusIcon = rl?.status === "allowed" ? "🟢" : rl?.status === "allowed_warning" ? "🟡" : rl ? "🔴" : "⚪";
-
-        const utilization = rl?.utilization ?? (typeof sf?.used_percentage === "number" ? sf.used_percentage / 100 : undefined);
-        const pct = utilization !== undefined ? ` ${(utilization * 100).toFixed(0)}% used` : "";
-        lines.push(`${statusIcon} ${label}${pct}`);
-
-        const resetsAt = rl?.resetsAt ?? sf?.resets_at;
-        if (resetsAt) {
-          lines.push(`  重置: ${this.formatResetTime(resetsAt)}`);
-        }
-        if (type === "five_hour" && win) {
-          lines.push(`  本 session: Input ${this.formatTokens(win.inputTokens)} / Output ${this.formatTokens(win.outputTokens)} / $${win.costUsd.toFixed(4)} / ${win.turns} turns`);
-        }
-        if (rl?.overageStatus) {
-          const overageIcon = rl.overageStatus === "allowed" ? "🟢" : "🔴";
-          lines.push(`  Overage: ${overageIcon} ${rl.overageStatus}${rl.isUsingOverage ? " (使用中)" : ""}`);
-        }
-      }
-    }
-
-    // Total cost
-    const cost = entry?.process.getTotalCost() ?? (statusFile?.cost as { total_cost_usd?: number })?.total_cost_usd;
-    if (cost !== undefined && cost > 0) {
-      lines.push("");
-      lines.push(`Session 累計: $${cost.toFixed(4)}`);
-    }
-
-    if (lines.length === 0) {
-      this.reply(ctx, "目前無使用資料");
-      return;
-    }
-
-    this.reply(ctx, lines.join("\n"));
-  }
-
-  /** Read Claude Code status line cache (rate limits, context window, cost). */
-  private readStatusFile(): Record<string, unknown> | null {
-    try {
-      const raw = readFileSync("/tmp/claude-status.json", "utf-8");
-      return JSON.parse(raw) as Record<string, unknown>;
-    } catch {
-      return null;
-    }
-  }
-
-  private formatTokens(n: number): string {
-    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-    return String(n);
-  }
-
-  private formatResetTime(epochSec: number): string {
-    const now = Math.floor(Date.now() / 1000);
-    const diff = epochSec - now;
-    if (diff <= 0) return "已重置";
-    const h = Math.floor(diff / 3600);
-    const m = Math.floor((diff % 3600) / 60);
-    if (h > 0) return `${h}h ${m}m 後`;
-    return `${m}m 後`;
   }
 
   private handleCost(ctx: CommandContext): void {

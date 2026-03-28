@@ -5,11 +5,12 @@ import type {
   ProviderAuthResult,
 } from "openclaw/plugin-sdk";
 import { homedir } from "node:os";
-import { readFileSync } from "node:fs";
 import path from "node:path";
 import { createBridgeServer } from "./bridge-server.js";
+import { HudWebSocket } from "./hud-ws.js";
 import { SessionStore } from "./session-store.js";
 import { CommandHandler } from "./command-handler.js";
+import { HudMonitor } from "./hud-monitor.js";
 
 const DEFAULT_PORT = 18810;
 const DEFAULT_CLAUDE_PATH = "claude";
@@ -169,30 +170,8 @@ function resolveDefaultModel(api: OpenClawPluginApi): string | undefined {
   return undefined;
 }
 
-function readStatusFile(): Record<string, unknown> | null {
-  try {
-    const raw = readFileSync("/tmp/claude-status.json", "utf-8");
-    return JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
-
-function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-  return String(n);
-}
-
-function fmtResetTime(epochSec: number): string {
-  const now = Math.floor(Date.now() / 1000);
-  const diff = epochSec - now;
-  if (diff <= 0) return "已重置";
-  const h = Math.floor(diff / 3600);
-  const m = Math.floor((diff % 3600) / 60);
-  if (h > 0) return `${h}h ${m}m 後`;
-  return `${m}m 後`;
-}
+/** Module-level shared state — OpenClaw may call register() multiple times in different scopes. */
+let sharedSessionStore: SessionStore | null = null;
 
 const plugin = {
   id: "claude-code-cli",
@@ -201,7 +180,8 @@ const plugin = {
 
   register(api: OpenClawPluginApi) {
     let bridge: ReturnType<typeof createBridgeServer> | null = null;
-    let sessionStore: SessionStore | null = null;
+    let hudMonitor: HudMonitor | null = null;
+    let hudWs: HudWebSocket | null = null;
 
     // --- Provider registration ---
     api.registerProvider({
@@ -306,7 +286,7 @@ const plugin = {
         }
 
         // Create shared SessionStore and CommandHandler
-        sessionStore = new SessionStore(
+        sharedSessionStore = new SessionStore(
           {
             claudePath,
             codexPath,
@@ -323,7 +303,7 @@ const plugin = {
           ctx.stateDir,
         );
         const agentCwdDefaults = resolveAgentCwdDefaults(api);
-        const commandHandler = new CommandHandler(sessionStore, { defaultCwd, defaultModel, agentCwdDefaults });
+        const commandHandler = new CommandHandler(sharedSessionStore, { defaultCwd, defaultModel, agentCwdDefaults });
 
         // Build model list for /v1/models endpoint
         const models = [
@@ -332,79 +312,61 @@ const plugin = {
           ...geminiModelList.map((m) => ({ id: m, owned_by: "google" })),
         ];
 
-        // Start HTTP bridge
+        // Start HUD monitor for statusLine-based rate limit tracking
+        hudMonitor = new HudMonitor({ claudePath, logger: ctx.logger });
+        hudMonitor.start();
+
+        // Start HUD WebSocket for pushing context/rate-limit data to arinova-chat
+        const channels = api.config?.channels as Record<string, Record<string, unknown>> | undefined;
+        const arinovaChannel = channels?.["openclaw-arinova-ai"];
+        if (arinovaChannel) {
+          const apiUrl = (arinovaChannel.apiUrl as string | undefined) ?? "https://api.chat.arinova.ai";
+          const wsUrl = apiUrl.replace(/^https?:\/\//, (m) => m.startsWith("https") ? "wss://" : "ws://") + "/api/v1/hud";
+          const accounts = arinovaChannel.accounts as Record<string, { enabled?: boolean; botToken?: string }> | undefined;
+          const firstToken = accounts
+            ? Object.values(accounts).find((a) => a.enabled && a.botToken)?.botToken
+            : undefined;
+          if (firstToken) {
+            hudWs = new HudWebSocket(wsUrl, firstToken, ctx.logger);
+            hudWs.connect();
+          } else {
+            ctx.logger.warn("hud-ws: no enabled account with botToken found, skipping");
+          }
+        }
+
+        // Start HTTP bridge (passes hudMonitor so turns trigger rate limit refresh)
         bridge = createBridgeServer({
           port,
-          sessionStore,
+          sessionStore: sharedSessionStore,
           commandHandler,
           logger: ctx.logger,
           models,
+          hudMonitor,
+          hudWs: hudWs ?? undefined,
         });
         await bridge.start();
       },
       stop: async () => {
+        if (hudWs) {
+          hudWs.close();
+          hudWs = null;
+        }
+        if (hudMonitor) {
+          hudMonitor.stop();
+          hudMonitor = null;
+        }
         if (bridge) {
           await bridge.stop();
           bridge = null;
         }
-        if (sessionStore) {
-          await sessionStore.stopAll();
-          sessionStore = null;
+        if (sharedSessionStore) {
+          await sharedSessionStore.stopAll();
+          sharedSessionStore = null;
         }
       },
     };
 
     api.registerService(bridgeService);
-
-    // --- Plugin command registration ---
-    api.registerCommand({
-      name: "hud",
-      description: "顯示 Claude Code rate limit 與 context 用量",
-      acceptsArgs: false,
-      handler: () => {
-        const lines: string[] = [];
-        const statusData = readStatusFile();
-
-        // Context window
-        const cw = statusData?.context_window as { used_percentage?: number; context_window_size?: number } | undefined;
-        if (cw?.used_percentage !== undefined && cw.context_window_size) {
-          lines.push(`Context: ${cw.used_percentage}% of ${fmtTokens(cw.context_window_size)}`);
-        }
-
-        // Rate limits
-        const rl = statusData?.rate_limits as Record<string, { used_percentage?: number; resets_at?: number }> | undefined;
-        const typeLabels: Record<string, string> = { five_hour: "5H Limit", seven_day: "7D Limit" };
-        for (const type of ["five_hour", "seven_day"] as const) {
-          const entry = rl?.[type];
-          if (entry?.used_percentage !== undefined) {
-            lines.push("");
-            const icon = entry.used_percentage < 80 ? "🟢" : entry.used_percentage < 95 ? "🟡" : "🔴";
-            lines.push(`${icon} ${typeLabels[type]} ${entry.used_percentage}% used`);
-            if (entry.resets_at) {
-              lines.push(`  重置: ${fmtResetTime(entry.resets_at)}`);
-            }
-          }
-        }
-
-        // Model
-        const model = statusData?.model as { display_name?: string } | undefined;
-        if (model?.display_name) {
-          lines.push("");
-          lines.push(`Model: ${model.display_name}`);
-        }
-
-        // Cost
-        const cost = statusData?.cost as { total_cost_usd?: number } | undefined;
-        if (cost?.total_cost_usd !== undefined && cost.total_cost_usd > 0) {
-          lines.push(`Cost: $${cost.total_cost_usd.toFixed(4)}`);
-        }
-
-        if (lines.length === 0) {
-          return { text: "目前無使用資料（需有 Claude Code session 執行中）" };
-        }
-        return { text: lines.join("\n") };
-      },
-    });
   },
 };
 

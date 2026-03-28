@@ -93,6 +93,7 @@ export class ClaudeProcess {
   // Keyed by rateLimitType (e.g. "five_hour", "seven_day")
   private rateLimits = new Map<string, RateLimitInfo>();
   private lastContext: ContextUsage | undefined;
+  private resolvedModel: string | undefined;
 
   // 5H window usage tracking
   private windowResetsAt = 0;
@@ -433,10 +434,13 @@ export class ClaudeProcess {
           if (msgUsage.cache_creation_input_tokens) {
             this.turnUsage.cache_creation_input_tokens = (this.turnUsage.cache_creation_input_tokens ?? 0) + msgUsage.cache_creation_input_tokens;
           }
-          // Track latest input tokens as context size (last message_start = most recent context)
-          const totalInput = (msgUsage.input_tokens ?? 0) + (msgUsage.cache_read_input_tokens ?? 0) + (msgUsage.cache_creation_input_tokens ?? 0);
-          if (totalInput > 0) {
-            this.turnContextTokens = totalInput;
+          // Track context size from the latest message_start
+          // All three categories occupy context window space (they differ only in billing rate)
+          const contextSize = (msgUsage.input_tokens ?? 0)
+            + (msgUsage.cache_read_input_tokens ?? 0)
+            + (msgUsage.cache_creation_input_tokens ?? 0);
+          if (contextSize > 0) {
+            this.turnContextTokens = contextSize;
           }
         }
       }
@@ -486,13 +490,22 @@ export class ClaudeProcess {
         this.turnDurationMs = event.duration_ms as number;
       }
 
-      // Extract contextWindow/maxOutputTokens from modelUsage
+      // Extract contextWindow/maxOutputTokens from modelUsage or model
       const modelUsage = event.modelUsage as Record<string, Record<string, unknown>> | undefined;
       if (modelUsage) {
-        for (const info of Object.values(modelUsage)) {
-          if (typeof info.contextWindow === "number") this.turnContextWindow = info.contextWindow;
+        for (const [modelId, info] of Object.entries(modelUsage)) {
+          // Only use the largest contextWindow (primary model, not sub-agent models like haiku)
+          const cw = typeof info.contextWindow === "number" ? info.contextWindow : 0;
+          if (cw > (this.turnContextWindow ?? 0)) {
+            this.turnContextWindow = cw;
+            this.resolvedModel = modelId;
+          }
           if (typeof info.maxOutputTokens === "number") this.turnMaxOutputTokens = info.maxOutputTokens;
         }
+      }
+      // Debug: log raw result fields to diagnose context tracking
+      if (!this.turnContextWindow) {
+        log.warn(`${this.tag}: contextWindow not found in result. modelUsage=${JSON.stringify(modelUsage ?? null)} model=${JSON.stringify(event.model ?? null)}`);
       }
 
       // Fallback: if stream events didn't provide usage, try result.usage
@@ -601,7 +614,7 @@ export class ClaudeProcess {
   }
 
   getModel(): string | undefined {
-    return this.opts.model;
+    return this.resolvedModel ?? this.opts.model;
   }
 
   getRateLimit(type?: string): RateLimitInfo | undefined {
@@ -628,4 +641,5 @@ export class ClaudeProcess {
       resetsAt: this.windowResetsAt,
     };
   }
+
 }
